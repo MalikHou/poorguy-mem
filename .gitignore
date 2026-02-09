@@ -1,0 +1,10 @@
+/build/
+/build-*/
+/.pgmem/
+/.cursor/
+*.log
+*.swp
+*.tmp
+.DS_Store
+.cache/
+.cursor/

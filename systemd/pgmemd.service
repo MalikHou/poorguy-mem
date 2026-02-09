@@ -1,0 +1,12 @@
+[Unit]
+Description=Poorguy Memory Daemon
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/pgmemd --host 127.0.0.1 --port 8765 --store-backend eloqstore --store-threads 0 --store-root %h/.pgmem/store --node-id local
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,13 @@
+{
+    "name": "ubuntu24.04",
+    "build": {
+      "dockerfile": "Dockerfile"
+    },
+    "runArgs": [
+      "--security-opt=seccomp=unconfined",
+      "--security-opt=apparmor=unconfined",
+      "--ulimit=memlock=-1:-1"
+    ],
+    "remoteUser": "root",
+    "workspaceFolder": "/workspaces/${localWorkspaceFolderBasename}"
+}

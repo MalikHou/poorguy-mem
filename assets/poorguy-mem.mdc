@@ -1,0 +1,7 @@
+---
+description: poorguy-mem auto memory hooks
+alwaysApply: true
+---
+When starting a new task, call `memory.bootstrap` first using the active workspace/session.
+After each assistant turn, call `memory.commit_turn` with user/assistant text plus code snippets and commands.
+Prefer `memory.search` before requesting additional user context.
