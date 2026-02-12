@@ -21,9 +21,8 @@ std::string Trim(const std::string& input) {
 
 std::string ToLower(const std::string& input) {
     std::string out = input;
-    std::transform(out.begin(), out.end(), out.begin(), [](unsigned char c) {
-        return static_cast<char>(std::tolower(c));
-    });
+    std::transform(out.begin(), out.end(), out.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
     return out;
 }
 

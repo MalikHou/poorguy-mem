@@ -1,10 +1,12 @@
 /build/
 /build-*/
 /.pgmem/
-/.cursor/
+.cache/
+.cursor/
+.mcp.json
+.vscode/
 *.log
 *.swp
 *.tmp
 .DS_Store
-.cache/
-.cursor/
+./compile_commands.json

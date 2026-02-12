@@ -8,11 +8,7 @@
 
 namespace pgmem {
 
-enum class OpType {
-    Upsert,
-    Pin,
-    Delete
-};
+enum class OpType { Upsert, Pin, Delete };
 
 struct MemoryRecord {
     std::string id;
@@ -22,9 +18,15 @@ struct MemoryRecord {
     std::string content;
     std::vector<std::string> tags;
     bool pinned{false};
+    bool tombstone{false};
     uint64_t created_at_ms{0};
     uint64_t updated_at_ms{0};
     uint64_t version{0};
+    uint64_t size_bytes{0};
+    uint64_t last_access_ms{0};
+    uint64_t hit_count{0};
+    double importance_score{0.0};
+    std::string tier{"hot"};
     std::string node_id;
 };
 
@@ -43,8 +45,20 @@ struct StatsSnapshot {
     double p95_read_ms{0.0};
     double p95_write_ms{0.0};
     double token_reduction_ratio{0.0};
-    uint64_t sync_lag_ops{0};
     double fallback_rate{0.0};
+    uint64_t mem_used_bytes{0};
+    uint64_t disk_used_bytes{0};
+    uint64_t item_count{0};
+    uint64_t tombstone_count{0};
+    uint64_t gc_last_run_ms{0};
+    uint64_t gc_evicted_count{0};
+    bool capacity_blocked{false};
+    std::string write_ack_mode{"accepted"};
+    uint64_t pending_write_ops{0};
+    uint64_t flush_failures_total{0};
+    uint64_t volatile_dropped_on_shutdown{0};
+    std::string effective_backend;
+    std::string last_flush_error;
 };
 
 struct CommitTurnInput {
@@ -71,21 +85,6 @@ struct SearchInput {
     int token_budget{2048};
 };
 
-struct SyncOp {
-    uint64_t op_seq{0};
-    OpType op_type{OpType::Upsert};
-    std::string workspace_id;
-    std::string memory_id;
-    uint64_t updated_at_ms{0};
-    std::string node_id;
-    std::string payload_json;
-};
-
-struct SyncBatch {
-    std::vector<SyncOp> ops;
-    uint64_t cursor{0};
-};
-
 struct StoreResult {
     bool ok{false};
     std::string error;
@@ -102,6 +101,19 @@ struct KeyValueEntry {
     std::string key;
     std::string value;
     uint64_t ts{0};
+};
+
+enum class WriteOp { Upsert, Delete };
+
+struct WriteEntry {
+    WriteOp op{WriteOp::Upsert};
+    KeyValueEntry entry;
+};
+
+struct StoreUsage {
+    uint64_t mem_used_bytes{0};
+    uint64_t disk_used_bytes{0};
+    uint64_t item_count{0};
 };
 
 using StringMap = std::map<std::string, std::string>;

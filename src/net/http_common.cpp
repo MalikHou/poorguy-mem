@@ -21,9 +21,8 @@ std::string Trim(const std::string& s) {
 
 std::string ToLower(const std::string& s) {
     std::string out = s;
-    std::transform(out.begin(), out.end(), out.begin(), [](unsigned char c) {
-        return static_cast<char>(std::tolower(c));
-    });
+    std::transform(out.begin(), out.end(), out.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
     return out;
 }
 
@@ -106,9 +105,9 @@ bool ParseHttpRequest(const std::string& raw, HttpRequest* request, size_t* cons
         if (sep == std::string::npos) {
             continue;
         }
-        const std::string key = ToLower(Trim(line.substr(0, sep)));
+        const std::string key   = ToLower(Trim(line.substr(0, sep)));
         const std::string value = Trim(line.substr(sep + 1));
-        request->headers[key] = value;
+        request->headers[key]   = value;
         if (key == "content-length") {
             try {
                 content_length = static_cast<size_t>(std::stoull(value));
@@ -130,7 +129,7 @@ bool ParseHttpRequest(const std::string& raw, HttpRequest* request, size_t* cons
     }
 
     request->body = raw.substr(body_offset, content_length);
-    *consumed = body_offset + content_length;
+    *consumed     = body_offset + content_length;
     return true;
 }
 

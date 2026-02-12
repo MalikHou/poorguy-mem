@@ -6,12 +6,9 @@
 
 namespace pgmem::core {
 
-std::string SummaryEngine::Update(const std::string& existing_summary,
-                                  const std::string& user_text,
-                                  const std::string& assistant_text,
-                                  const std::vector<std::string>& code_snippets,
-                                  const std::vector<std::string>& commands,
-                                  size_t max_tokens) const {
+std::string SummaryEngine::Update(const std::string& existing_summary, const std::string& user_text,
+                                  const std::string& assistant_text, const std::vector<std::string>& code_snippets,
+                                  const std::vector<std::string>& commands, size_t max_tokens) const {
     std::ostringstream oss;
     if (!existing_summary.empty()) {
         oss << existing_summary << "\n";

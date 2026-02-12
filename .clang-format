@@ -1,0 +1,24 @@
+BasedOnStyle: Google
+
+# Indent 4 spaces at a time.
+IndentWidth: 4
+
+# Keep lines under 120 columns long.
+ColumnLimit: 120
+
+# Indent case labels.
+IndentCaseLabels: true
+
+# ANGLE likes to align things as much as possible.
+AlignOperands: true
+AlignConsecutiveAssignments: true
+
+# Use 2 space negative offset for access modifiers
+AccessModifierOffset: -4
+
+# Useful for spacing out functions in classes
+KeepEmptyLinesAtTheStartOfBlocks: true
+
+# For pointer alignment, use the following:
+DerivePointerAlignment: false
+PointerAlignment: Left

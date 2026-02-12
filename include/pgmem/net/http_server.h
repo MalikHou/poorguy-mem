@@ -3,36 +3,42 @@
 #include <atomic>
 #include <functional>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <string>
-#include <thread>
 
 #include "pgmem/net/http_common.h"
 
+namespace brpc {
+class Server;
+}
+
 namespace pgmem::net {
+
+struct HttpServerOptions {
+    int num_threads{0};
+};
 
 class HttpServer {
 public:
     using Handler = std::function<HttpResponse(const HttpRequest&)>;
 
-    HttpServer(std::string host, int port);
+    HttpServer(std::string host, int port, HttpServerOptions options = {});
     ~HttpServer();
 
     void RegisterRoute(const std::string& method, const std::string& path, Handler handler);
 
     bool Start(std::string* error);
     void Stop();
+    HttpResponse Dispatch(const HttpRequest& request);
 
 private:
-    void AcceptLoop();
-    void HandleClient(int client_fd);
-
     std::string host_;
     int port_;
+    HttpServerOptions options_;
 
-    int listen_fd_{-1};
     std::atomic<bool> running_{false};
-    std::thread accept_thread_;
+    std::unique_ptr<brpc::Server> server_;
 
     std::mutex mu_;
     std::map<std::string, Handler> routes_;

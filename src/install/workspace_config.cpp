@@ -1,28 +1,58 @@
 #include "pgmem/install/workspace_config.h"
 
-#include <cstdio>
-#include <cstdlib>
-#include <filesystem>
-#include <fstream>
-#include <sstream>
 #include <sys/wait.h>
 
 #include <boost/property_tree/json_parser.hpp>
 #include <boost/property_tree/ptree.hpp>
+#include <cstdio>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <iostream>
+#include <sstream>
 
 namespace pgmem::install {
 namespace {
 
 namespace fs = std::filesystem;
 
+bool LooksLikeCommandNotFound(const std::string& output, const std::string& command) {
+    const bool has_cmd       = output.find(command) != std::string::npos;
+    const bool has_not_found = output.find("not found") != std::string::npos ||
+                               output.find("command not found") != std::string::npos ||
+                               output.find("No such file or directory") != std::string::npos;
+    return has_cmd && has_not_found;
+}
+
+bool LooksLikeCodexUnavailable(const std::string& output) {
+    if (LooksLikeCommandNotFound(output, "codex")) {
+        return true;
+    }
+    const bool has_permission_issue = output.find("Permission denied") != std::string::npos ||
+                                      output.find("failed to write MCP servers") != std::string::npos ||
+                                      output.find("failed to persist config.toml") != std::string::npos;
+    return has_permission_issue;
+}
+
 std::string RuleContent() {
     return R"(---
-description: poorguy-mem auto memory hooks
+description: poorguy-mem memory server contract
 alwaysApply: true
 ---
-When starting a new task, call `memory.bootstrap` first using the active workspace/session.
-After each assistant turn, call `memory.commit_turn` with user/assistant text plus code snippets and commands.
-Prefer `memory.search` before requesting additional user context.
+`poorguy-mem` is the workspace memory MCP server.
+
+Execution contract:
+1. If schema is unknown, call `memory.describe` first and follow its contract.
+2. At task/session start, call `memory.bootstrap` with current `workspace_id` and `session_id`.
+3. Before asking for repeated context, call `memory.search` to recall prior facts.
+4. After each meaningful assistant turn, call `memory.commit_turn` with:
+   `workspace_id`, `session_id`, `user_text`, `assistant_text`, plus useful `code_snippets` and `commands`.
+5. If user marks information as important, call `memory.pin`.
+6. For diagnostics only, call `memory.stats` or `memory.compact`.
+
+Protocol constraints:
+- Use only `POST /mcp` with `memory.*` methods.
+- `/sync/push` and `/sync/pull` are removed and must be treated as unavailable.
 )";
 }
 
@@ -103,6 +133,9 @@ bool WorkspaceConfigurator::ConfigureCursorMcp(const InstallOptions& options, st
 
     boost::property_tree::ptree server;
     server.put("url", options.mcp_url);
+    server.put(
+        "description",
+        "Local memory server for this workspace. Use memory.describe/bootstrap/search/commit_turn/pin/stats/compact.");
     servers.put_child(options.mcp_name, server);
 
     root.put_child("mcpServers", servers);
@@ -204,6 +237,11 @@ bool WorkspaceConfigurator::ConfigureCodexMcp(const InstallOptions& options, std
         return true;
     }
 
+    if (LooksLikeCodexUnavailable(output)) {
+        std::cerr << "[pgmem-install] warning: codex CLI unavailable, skipping Codex MCP registration\n";
+        return true;
+    }
+
     const std::string add_cmd = "codex mcp add " + options.mcp_name + " --url " + options.mcp_url;
     if (!RunCommand(add_cmd, &output, &code)) {
         if (error != nullptr) {
@@ -213,6 +251,10 @@ bool WorkspaceConfigurator::ConfigureCodexMcp(const InstallOptions& options, std
     }
 
     if (code != 0) {
+        if (LooksLikeCodexUnavailable(output)) {
+            std::cerr << "[pgmem-install] warning: codex CLI unavailable, skipping Codex MCP registration\n";
+            return true;
+        }
         if (error != nullptr) {
             *error = "codex mcp add failed: " + output;
         }
@@ -230,6 +272,11 @@ bool WorkspaceConfigurator::RemoveCodexMcp(const InstallOptions& options, std::s
             *error = "failed to run codex mcp remove";
         }
         return false;
+    }
+
+    if (LooksLikeCodexUnavailable(output)) {
+        std::cerr << "[pgmem-install] warning: codex CLI unavailable, skipping Codex MCP removal\n";
+        return true;
     }
 
     // If the server is already absent, codex may return non-zero; treat that as acceptable.
@@ -260,9 +307,20 @@ bool WorkspaceConfigurator::WriteSystemdUnit(const InstallOptions& options, std:
     out << "After=network.target\n\n";
     out << "[Service]\n";
     out << "Type=simple\n";
-    out << "ExecStart=" << options.pgmemd_bin
-        << " --host 127.0.0.1 --port 8765 --store-backend eloqstore --store-threads 0 --store-root "
-        << options.workspace_root << "/.pgmem/store --node-id local\n";
+    out << "ExecStart=" << options.pgmemd_bin << " --host " << config::kDefaultHost << " --port "
+        << config::kDefaultMcpPort << " --store-backend " << config::kDefaultStoreBackend << " --core-number "
+        << options.core_number << " --enable-io-uring-network-engine "
+        << (options.enable_io_uring_network_engine ? "true" : "false") << " --mem-budget-mb "
+        << config::kDefaultMemBudgetMb << " --disk-budget-gb " << config::kDefaultDiskBudgetGb
+        << " --gc-high-watermark " << config::kDefaultGcHighWatermark << " --gc-low-watermark "
+        << config::kDefaultGcLowWatermark << " --gc-batch-size " << config::kDefaultGcBatchSize
+        << " --max-record-bytes " << config::kDefaultMaxRecordBytes << " --enable-tombstone-gc "
+        << (config::kDefaultEnableTombstoneGc ? "true" : "false") << " --shutdown-drain-timeout-ms "
+        << config::kDefaultShutdownDrainTimeoutMs << " --store-root " << options.workspace_root << "/.pgmem/store";
+    if (!options.pgmemd_extra_args.empty()) {
+        out << " " << options.pgmemd_extra_args;
+    }
+    out << "\n";
     out << "Restart=on-failure\n";
     out << "RestartSec=2\n\n";
     out << "[Install]\n";

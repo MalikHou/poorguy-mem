@@ -1,47 +1,75 @@
 #include "pgmem/net/http_server.h"
 
-#include <arpa/inet.h>
-#include <netinet/in.h>
-#include <sys/socket.h>
-#include <unistd.h>
+#include <brpc/closure_guard.h>
+#include <brpc/controller.h>
+#include <brpc/http_method.h>
+#include <brpc/server.h>
+#include <butil/errno.h>
 
-#include <cerrno>
-#include <cstring>
-#include <iostream>
-#include <thread>
+#include <cctype>
+#include <utility>
+
+#include "http_router.pb.h"
 
 namespace pgmem::net {
 namespace {
 
-std::string RouteKey(const std::string& method, const std::string& path) {
-    return method + " " + path;
-}
-
-void CloseFd(int fd) {
-    if (fd >= 0) {
-        ::close(fd);
+std::string ToUpper(std::string value) {
+    for (char& c : value) {
+        c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
     }
+    return value;
 }
 
-bool SendAll(int fd, const std::string& data) {
-    size_t sent = 0;
-    while (sent < data.size()) {
-        const ssize_t n = ::send(fd, data.data() + sent, data.size() - sent, 0);
-        if (n <= 0) {
-            return false;
+std::string RouteKey(const std::string& method, const std::string& path) { return ToUpper(method) + " " + path; }
+
+class HttpMasterServiceImpl final : public HttpMasterService {
+public:
+    explicit HttpMasterServiceImpl(HttpServer* server) : server_(server) {}
+
+    void default_method(::google::protobuf::RpcController* cntl_base, const HttpMasterRequest*, HttpMasterResponse*,
+                        ::google::protobuf::Closure* done) override {
+        brpc::ClosureGuard done_guard(done);
+        auto* cntl = static_cast<brpc::Controller*>(cntl_base);
+
+        HttpRequest request;
+        const char* method_text = brpc::HttpMethod2Str(cntl->http_request().method());
+        request.method          = method_text != nullptr ? method_text : "GET";
+        request.path            = cntl->http_request().uri().path();
+        if (request.path.empty()) {
+            request.path = "/";
         }
-        sent += static_cast<size_t>(n);
+        if (!cntl->http_request().uri().query().empty()) {
+            request.path.append("?");
+            request.path.append(cntl->http_request().uri().query());
+        }
+        request.version = "HTTP/1.1";
+
+        for (auto it = cntl->http_request().HeaderBegin(); it != cntl->http_request().HeaderEnd(); ++it) {
+            request.headers[it->first] = it->second;
+        }
+        request.body = cntl->request_attachment().to_string();
+
+        const HttpResponse response = server_->Dispatch(request);
+
+        cntl->http_response().set_status_code(response.status_code);
+        cntl->http_response().set_content_type(response.content_type);
+        for (const auto& kv : response.headers) {
+            cntl->http_response().SetHeader(kv.first, kv.second);
+        }
+        cntl->response_attachment().append(response.body);
     }
-    return true;
-}
+
+private:
+    HttpServer* server_;
+};
 
 }  // namespace
 
-HttpServer::HttpServer(std::string host, int port) : host_(std::move(host)), port_(port) {}
+HttpServer::HttpServer(std::string host, int port, HttpServerOptions options)
+    : host_(std::move(host)), port_(port), options_(options) {}
 
-HttpServer::~HttpServer() {
-    Stop();
-}
+HttpServer::~HttpServer() { Stop(); }
 
 void HttpServer::RegisterRoute(const std::string& method, const std::string& path, Handler handler) {
     std::lock_guard<std::mutex> lock(mu_);
@@ -53,56 +81,23 @@ bool HttpServer::Start(std::string* error) {
         return true;
     }
 
-    listen_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
-    if (listen_fd_ < 0) {
+    auto server = std::make_unique<brpc::Server>();
+    brpc::ServerOptions server_options;
+    if (options_.num_threads > 0) {
+        server_options.num_threads = options_.num_threads;
+    }
+    server_options.http_master_service = new HttpMasterServiceImpl(this);
+
+    const std::string endpoint = host_ + ":" + std::to_string(port_);
+    if (server->Start(endpoint.c_str(), &server_options) != 0) {
         if (error != nullptr) {
-            *error = "socket() failed: " + std::string(std::strerror(errno));
+            *error = std::string("brpc start failed: ") + berror(errno);
         }
         return false;
     }
 
-    int opt = 1;
-    if (::setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) != 0) {
-        if (error != nullptr) {
-            *error = "setsockopt() failed: " + std::string(std::strerror(errno));
-        }
-        CloseFd(listen_fd_);
-        listen_fd_ = -1;
-        return false;
-    }
-
-    sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(static_cast<uint16_t>(port_));
-    if (::inet_pton(AF_INET, host_.c_str(), &addr.sin_addr) != 1) {
-        if (error != nullptr) {
-            *error = "invalid host: " + host_;
-        }
-        CloseFd(listen_fd_);
-        listen_fd_ = -1;
-        return false;
-    }
-
-    if (::bind(listen_fd_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
-        if (error != nullptr) {
-            *error = "bind() failed: " + std::string(std::strerror(errno));
-        }
-        CloseFd(listen_fd_);
-        listen_fd_ = -1;
-        return false;
-    }
-
-    if (::listen(listen_fd_, 256) != 0) {
-        if (error != nullptr) {
-            *error = "listen() failed: " + std::string(std::strerror(errno));
-        }
-        CloseFd(listen_fd_);
-        listen_fd_ = -1;
-        return false;
-    }
-
+    server_ = std::move(server);
     running_.store(true);
-    accept_thread_ = std::thread(&HttpServer::AcceptLoop, this);
     return true;
 }
 
@@ -110,68 +105,20 @@ void HttpServer::Stop() {
     if (!running_.exchange(false)) {
         return;
     }
-
-    if (listen_fd_ >= 0) {
-        ::shutdown(listen_fd_, SHUT_RDWR);
-        CloseFd(listen_fd_);
-        listen_fd_ = -1;
-    }
-    if (accept_thread_.joinable()) {
-        accept_thread_.join();
+    if (server_ != nullptr) {
+        server_->Stop(0);
+        server_->Join();
+        server_.reset();
     }
 }
 
-void HttpServer::AcceptLoop() {
-    while (running_.load()) {
-        sockaddr_in client_addr{};
-        socklen_t client_len = sizeof(client_addr);
-        const int client_fd = ::accept(listen_fd_, reinterpret_cast<sockaddr*>(&client_addr), &client_len);
-        if (client_fd < 0) {
-            if (running_.load()) {
-                std::cerr << "accept() failed: " << std::strerror(errno) << "\n";
-            }
-            continue;
-        }
-        std::thread(&HttpServer::HandleClient, this, client_fd).detach();
-    }
-}
-
-void HttpServer::HandleClient(int client_fd) {
-    std::string raw;
-    raw.reserve(4096);
-    char buffer[4096];
-
-    HttpRequest request;
-    size_t consumed = 0;
-    std::string parse_error;
-
-    while (true) {
-        const ssize_t n = ::recv(client_fd, buffer, sizeof(buffer), 0);
-        if (n <= 0) {
-            break;
-        }
-        raw.append(buffer, static_cast<size_t>(n));
-        if (ParseHttpRequest(raw, &request, &consumed, &parse_error)) {
-            break;
-        }
-        if (parse_error != "incomplete header" && parse_error != "incomplete body") {
-            break;
-        }
-    }
-
+HttpResponse HttpServer::Dispatch(const HttpRequest& request) {
     HttpResponse response;
-    if (consumed == 0) {
-        response.status_code = 400;
-        response.body = "{\"error\":\"invalid HTTP request\"}";
-        SendAll(client_fd, BuildHttpResponse(response));
-        CloseFd(client_fd);
-        return;
-    }
 
     Handler handler;
     {
         std::lock_guard<std::mutex> lock(mu_);
-        auto it = routes_.find(RouteKey(request.method, request.path));
+        const auto it = routes_.find(RouteKey(request.method, request.path));
         if (it != routes_.end()) {
             handler = it->second;
         }
@@ -179,18 +126,17 @@ void HttpServer::HandleClient(int client_fd) {
 
     if (!handler) {
         response.status_code = 404;
-        response.body = "{\"error\":\"route not found\"}";
-    } else {
-        try {
-            response = handler(request);
-        } catch (const std::exception& ex) {
-            response.status_code = 500;
-            response.body = std::string("{\"error\":\"") + ex.what() + "\"}";
-        }
+        response.body        = "{\"error\":\"route not found\"}";
+        return response;
     }
 
-    SendAll(client_fd, BuildHttpResponse(response));
-    CloseFd(client_fd);
+    try {
+        return handler(request);
+    } catch (const std::exception& ex) {
+        response.status_code = 500;
+        response.body        = std::string("{\"error\":\"") + ex.what() + "\"}";
+        return response;
+    }
 }
 
 }  // namespace pgmem::net

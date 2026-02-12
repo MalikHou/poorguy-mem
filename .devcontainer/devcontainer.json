@@ -4,10 +4,13 @@
       "dockerfile": "Dockerfile"
     },
     "runArgs": [
+      "--privileged",
       "--security-opt=seccomp=unconfined",
       "--security-opt=apparmor=unconfined",
-      "--ulimit=memlock=-1:-1"
+      "--ulimit=memlock=-1:-1",
+      "--ulimit=nofile=1048576:1048576"
     ],
+    "postStartCommand": "bash -lc 'echo [pgmem] kernel=$(uname -r); if [ -r /proc/sys/kernel/io_uring_disabled ]; then v=$(cat /proc/sys/kernel/io_uring_disabled); echo [pgmem] io_uring_disabled=$v; if [ \"$v\" != \"0\" ]; then echo [pgmem][WARN] io_uring is disabled by host kernel policy; fi; fi; if [ -r /proc/sys/kernel/io_uring_group ]; then echo [pgmem] io_uring_group=$(cat /proc/sys/kernel/io_uring_group); fi; echo [pgmem] memlock_ulimit=$(ulimit -l); echo [pgmem] nofile_ulimit=$(ulimit -n); if command -v python-stable >/dev/null 2>&1; then echo [pgmem] python_stable=$(python-stable --version 2>&1); elif command -v python3.11 >/dev/null 2>&1; then echo [pgmem] python_stable=$(python3.11 --version 2>&1); else echo [pgmem][WARN] python3.11 not found; fi'",
     "remoteUser": "root",
     "workspaceFolder": "/workspaces/${localWorkspaceFolderBasename}"
 }

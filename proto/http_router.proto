@@ -1,0 +1,13 @@
+syntax = "proto2";
+
+package pgmem.net;
+
+option cc_generic_services = true;
+
+message HttpMasterRequest {}
+
+message HttpMasterResponse {}
+
+service HttpMasterService {
+    rpc default_method(HttpMasterRequest) returns (HttpMasterResponse);
+}

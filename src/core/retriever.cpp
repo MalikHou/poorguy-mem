@@ -29,12 +29,12 @@ HybridRetriever::HybridRetriever(size_t embedding_dim) : embedding_dim_(embeddin
 
 void HybridRetriever::Index(const MemoryRecord& record) {
     IndexedDoc doc;
-    doc.record = record;
+    doc.record        = record;
     const auto tokens = util::Tokenize(record.content);
     for (const std::string& token : tokens) {
         ++doc.tf[token];
     }
-    doc.doc_len = tokens.size();
+    doc.doc_len   = tokens.size();
     doc.embedding = Embed(record.content);
 
     std::unique_lock<std::shared_mutex> lock(mu_);
@@ -46,7 +46,7 @@ void HybridRetriever::Index(const MemoryRecord& record) {
 
     auto next = std::make_shared<WorkspaceSnapshot>();
     if (old_snapshot) {
-        next->docs = old_snapshot->docs;
+        next->docs          = old_snapshot->docs;
         next->total_doc_len = old_snapshot->total_doc_len;
     }
 
@@ -59,7 +59,7 @@ void HybridRetriever::Index(const MemoryRecord& record) {
     next->docs[record.id] = std::move(doc);
     next->total_doc_len += tokens.size();
 
-    next->df = BuildDocumentFrequency(next->docs);
+    next->df                        = BuildDocumentFrequency(next->docs);
     snapshots_[record.workspace_id] = std::move(next);
 }
 
@@ -70,7 +70,7 @@ void HybridRetriever::Remove(const std::string& workspace_id, const std::string&
         return;
     }
 
-    auto next = std::make_shared<WorkspaceSnapshot>(*old_it->second);
+    auto next         = std::make_shared<WorkspaceSnapshot>(*old_it->second);
     const auto doc_it = next->docs.find(memory_id);
     if (doc_it == next->docs.end()) {
         return;
@@ -86,12 +86,11 @@ void HybridRetriever::Remove(const std::string& workspace_id, const std::string&
         return;
     }
 
-    next->df = BuildDocumentFrequency(next->docs);
+    next->df                 = BuildDocumentFrequency(next->docs);
     snapshots_[workspace_id] = std::move(next);
 }
 
-std::vector<SearchHit> HybridRetriever::Search(const SearchInput& input,
-                                               bool* semantic_fallback_used) {
+std::vector<SearchHit> HybridRetriever::Search(const SearchInput& input, bool* semantic_fallback_used) {
     if (semantic_fallback_used != nullptr) {
         *semantic_fallback_used = false;
     }
@@ -126,9 +125,8 @@ std::vector<SearchHit> HybridRetriever::Search(const SearchInput& input,
     }
 
     const size_t total_docs = snapshot->docs.size();
-    const double avgdl = total_docs > 0
-        ? static_cast<double>(snapshot->total_doc_len) / static_cast<double>(total_docs)
-        : 1.0;
+    const double avgdl =
+        total_docs > 0 ? static_cast<double>(snapshot->total_doc_len) / static_cast<double>(total_docs) : 1.0;
 
     std::vector<SearchHit> hits;
     hits.reserve(total_docs);
@@ -136,10 +134,10 @@ std::vector<SearchHit> HybridRetriever::Search(const SearchInput& input,
     for (const auto& kv : snapshot->docs) {
         const IndexedDoc& doc = kv.second;
         SearchHit hit;
-        hit.memory_id = doc.record.id;
-        hit.source = doc.record.source;
-        hit.content = doc.record.content;
-        hit.pinned = doc.record.pinned;
+        hit.memory_id     = doc.record.id;
+        hit.source        = doc.record.source;
+        hit.content       = doc.record.content;
+        hit.pinned        = doc.record.pinned;
         hit.updated_at_ms = doc.record.updated_at_ms;
 
         hit.lexical_score = LexicalScore(doc, query_tf, total_docs, avgdl, snapshot->df);
@@ -203,17 +201,15 @@ double HybridRetriever::Cosine(const std::vector<float>& a, const std::vector<fl
     return dot;
 }
 
-double HybridRetriever::LexicalScore(const IndexedDoc& doc,
-                                     const std::unordered_map<std::string, int>& query_tf,
-                                     size_t total_docs,
-                                     double avg_doc_len,
+double HybridRetriever::LexicalScore(const IndexedDoc& doc, const std::unordered_map<std::string, int>& query_tf,
+                                     size_t total_docs, double avg_doc_len,
                                      const std::unordered_map<std::string, size_t>& df) const {
     if (doc.doc_len == 0 || query_tf.empty() || total_docs == 0) {
         return 0.0;
     }
 
     constexpr double k1 = 1.5;
-    constexpr double b = 0.75;
+    constexpr double b  = 0.75;
 
     const double avgdl = avg_doc_len > 0.0 ? avg_doc_len : 1.0;
 
@@ -224,19 +220,17 @@ double HybridRetriever::LexicalScore(const IndexedDoc& doc,
             continue;
         }
 
-        const double tf = static_cast<double>(tf_it->second);
-        const auto df_it = df.find(q.first);
+        const double tf       = static_cast<double>(tf_it->second);
+        const auto df_it      = df.find(q.first);
         const double doc_freq = (df_it == df.end()) ? 0.0 : static_cast<double>(df_it->second);
 
-        const double idf = std::log((static_cast<double>(total_docs) - doc_freq + 0.5) / (doc_freq + 0.5) + 1.0);
+        const double idf   = std::log((static_cast<double>(total_docs) - doc_freq + 0.5) / (doc_freq + 0.5) + 1.0);
         const double denom = tf + k1 * (1.0 - b + b * (static_cast<double>(doc.doc_len) / avgdl));
         score += idf * (tf * (k1 + 1.0) / denom);
     }
     return score;
 }
 
-std::unique_ptr<IRetriever> CreateHybridRetriever() {
-    return std::make_unique<HybridRetriever>();
-}
+std::unique_ptr<IRetriever> CreateHybridRetriever() { return std::make_unique<HybridRetriever>(); }
 
 }  // namespace pgmem::core

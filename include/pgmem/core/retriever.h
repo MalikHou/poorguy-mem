@@ -13,11 +13,10 @@ namespace pgmem::core {
 
 class IRetriever {
 public:
-    virtual ~IRetriever() = default;
-    virtual void Index(const MemoryRecord& record) = 0;
-    virtual void Remove(const std::string& workspace_id, const std::string& memory_id) = 0;
-    virtual std::vector<SearchHit> Search(const SearchInput& input,
-                                          bool* semantic_fallback_used) = 0;
+    virtual ~IRetriever()                                                                         = default;
+    virtual void Index(const MemoryRecord& record)                                                = 0;
+    virtual void Remove(const std::string& workspace_id, const std::string& memory_id)            = 0;
+    virtual std::vector<SearchHit> Search(const SearchInput& input, bool* semantic_fallback_used) = 0;
 };
 
 class HybridRetriever final : public IRetriever {
@@ -44,11 +43,8 @@ private:
 
     std::vector<float> Embed(const std::string& text) const;
     double Cosine(const std::vector<float>& a, const std::vector<float>& b) const;
-    double LexicalScore(const IndexedDoc& doc,
-                        const std::unordered_map<std::string, int>& query_tf,
-                        size_t total_docs,
-                        double avg_doc_len,
-                        const std::unordered_map<std::string, size_t>& df) const;
+    double LexicalScore(const IndexedDoc& doc, const std::unordered_map<std::string, int>& query_tf, size_t total_docs,
+                        double avg_doc_len, const std::unordered_map<std::string, size_t>& df) const;
 
     size_t embedding_dim_;
     mutable std::shared_mutex mu_;

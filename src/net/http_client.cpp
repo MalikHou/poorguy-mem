@@ -1,103 +1,110 @@
 #include "pgmem/net/http_client.h"
 
-#include <arpa/inet.h>
-#include <sys/socket.h>
-#include <unistd.h>
+#include <brpc/channel.h>
+#include <brpc/controller.h>
+#include <brpc/http_method.h>
+#include <butil/errno.h>
 
-#include <cerrno>
-#include <cstring>
-#include <sstream>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <unordered_map>
+#include <utility>
 
 namespace pgmem::net {
 namespace {
 
-bool SendAll(int fd, const std::string& data) {
-    size_t sent = 0;
-    while (sent < data.size()) {
-        const ssize_t n = ::send(fd, data.data() + sent, data.size() - sent, 0);
-        if (n <= 0) {
-            return false;
+struct ChannelCache {
+    std::mutex mu;
+    std::unordered_map<std::string, std::weak_ptr<brpc::Channel>> by_endpoint;
+};
+
+ChannelCache& GetChannelCache() {
+    static ChannelCache cache;
+    return cache;
+}
+
+std::string EndpointKey(const std::string& host, int port) { return host + ":" + std::to_string(port); }
+
+std::string BuildHttpUri(const std::string& host, int port, const std::string& path) {
+    if (path.empty()) {
+        return "http://" + host + ":" + std::to_string(port) + "/";
+    }
+    if (path.front() == '/') {
+        return "http://" + host + ":" + std::to_string(port) + path;
+    }
+    return "http://" + host + ":" + std::to_string(port) + "/" + path;
+}
+
+std::shared_ptr<brpc::Channel> AcquireChannel(const std::string& host, int port, std::string* error) {
+    const std::string endpoint_key = EndpointKey(host, port);
+
+    {
+        std::lock_guard<std::mutex> lock(GetChannelCache().mu);
+        auto it = GetChannelCache().by_endpoint.find(endpoint_key);
+        if (it != GetChannelCache().by_endpoint.end()) {
+            auto channel = it->second.lock();
+            if (channel != nullptr) {
+                return channel;
+            }
         }
-        sent += static_cast<size_t>(n);
     }
-    return true;
+
+    auto channel = std::make_shared<brpc::Channel>();
+    brpc::ChannelOptions options;
+    options.protocol        = "http";
+    options.connection_type = "pooled";
+    if (channel->Init(host.c_str(), port, &options) != 0) {
+        if (error != nullptr) {
+            *error = std::string("brpc channel init failed: ") + berror(errno);
+        }
+        return nullptr;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(GetChannelCache().mu);
+        GetChannelCache().by_endpoint[endpoint_key] = channel;
+    }
+    return channel;
 }
 
-int ParseStatusCode(const std::string& response) {
-    const size_t line_end = response.find("\r\n");
-    if (line_end == std::string::npos) {
-        return 0;
-    }
-    std::istringstream iss(response.substr(0, line_end));
-    std::string version;
-    int code = 0;
-    iss >> version >> code;
-    return code;
-}
-
-std::string ParseBody(const std::string& response) {
-    const size_t offset = response.find("\r\n\r\n");
-    if (offset == std::string::npos) {
-        return {};
-    }
-    return response.substr(offset + 4);
-}
-
-HttpClientResponse ExecRequest(const std::string& host,
-                               int port,
-                               const std::string& request,
-                               int timeout_ms) {
+HttpClientResponse ExecRequest(const std::string& host, int port, const std::string& path, brpc::HttpMethod method,
+                               const std::string& body, const std::string& content_type, int timeout_ms) {
     HttpClientResponse out;
 
-    int fd = ::socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) {
-        out.error = "socket() failed";
+    std::string channel_error;
+    auto channel = AcquireChannel(host, port, &channel_error);
+    if (channel == nullptr) {
+        out.error = channel_error;
         return out;
     }
 
-    timeval tv{};
-    tv.tv_sec = timeout_ms / 1000;
-    tv.tv_usec = (timeout_ms % 1000) * 1000;
-    ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    brpc::Controller cntl;
+    if (timeout_ms > 0) {
+        cntl.set_timeout_ms(timeout_ms);
+    }
+    cntl.http_request().uri() = BuildHttpUri(host, port, path);
+    cntl.http_request().set_method(method);
+    if (!content_type.empty()) {
+        cntl.http_request().set_content_type(content_type);
+    }
+    if (!body.empty()) {
+        cntl.request_attachment().append(body);
+    }
 
-    sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(static_cast<uint16_t>(port));
-    if (::inet_pton(AF_INET, host.c_str(), &addr.sin_addr) != 1) {
-        out.error = "invalid host";
-        ::close(fd);
+    channel->CallMethod(nullptr, &cntl, nullptr, nullptr, nullptr);
+
+    out.status_code = cntl.http_response().status_code();
+    out.body        = cntl.response_attachment().to_string();
+
+    if (cntl.Failed()) {
+        out.error = cntl.ErrorText();
+        out.ok    = false;
         return out;
     }
 
-    if (::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
-        out.error = std::string("connect() failed: ") + std::strerror(errno);
-        ::close(fd);
-        return out;
-    }
-
-    if (!SendAll(fd, request)) {
-        out.error = "send() failed";
-        ::close(fd);
-        return out;
-    }
-
-    std::string response;
-    char buf[4096];
-    while (true) {
-        const ssize_t n = ::recv(fd, buf, sizeof(buf), 0);
-        if (n <= 0) {
-            break;
-        }
-        response.append(buf, static_cast<size_t>(n));
-    }
-
-    ::close(fd);
-
-    out.status_code = ParseStatusCode(response);
-    out.body = ParseBody(response);
     out.ok = (out.status_code >= 200 && out.status_code < 300);
-    if (!out.ok && out.error.empty()) {
+    if (!out.ok) {
         out.error = "non-2xx status";
     }
     return out;
@@ -105,30 +112,13 @@ HttpClientResponse ExecRequest(const std::string& host,
 
 }  // namespace
 
-HttpClientResponse HttpClient::PostJson(const std::string& host,
-                                        int port,
-                                        const std::string& path,
-                                        const std::string& body,
-                                        int timeout_ms) const {
-    std::ostringstream oss;
-    oss << "POST " << path << " HTTP/1.1\r\n";
-    oss << "Host: " << host << ':' << port << "\r\n";
-    oss << "Content-Type: application/json\r\n";
-    oss << "Content-Length: " << body.size() << "\r\n";
-    oss << "Connection: close\r\n\r\n";
-    oss << body;
-    return ExecRequest(host, port, oss.str(), timeout_ms);
+HttpClientResponse HttpClient::PostJson(const std::string& host, int port, const std::string& path,
+                                        const std::string& body, int timeout_ms) const {
+    return ExecRequest(host, port, path, brpc::HTTP_METHOD_POST, body, "application/json", timeout_ms);
 }
 
-HttpClientResponse HttpClient::Get(const std::string& host,
-                                   int port,
-                                   const std::string& path,
-                                   int timeout_ms) const {
-    std::ostringstream oss;
-    oss << "GET " << path << " HTTP/1.1\r\n";
-    oss << "Host: " << host << ':' << port << "\r\n";
-    oss << "Connection: close\r\n\r\n";
-    return ExecRequest(host, port, oss.str(), timeout_ms);
+HttpClientResponse HttpClient::Get(const std::string& host, int port, const std::string& path, int timeout_ms) const {
+    return ExecRequest(host, port, path, brpc::HTTP_METHOD_GET, std::string(), std::string(), timeout_ms);
 }
 
 }  // namespace pgmem::net

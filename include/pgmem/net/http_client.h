@@ -13,16 +13,10 @@ struct HttpClientResponse {
 
 class HttpClient {
 public:
-    HttpClientResponse PostJson(const std::string& host,
-                                int port,
-                                const std::string& path,
-                                const std::string& body,
+    HttpClientResponse PostJson(const std::string& host, int port, const std::string& path, const std::string& body,
                                 int timeout_ms) const;
 
-    HttpClientResponse Get(const std::string& host,
-                           int port,
-                           const std::string& path,
-                           int timeout_ms) const;
+    HttpClientResponse Get(const std::string& host, int port, const std::string& path, int timeout_ms) const;
 };
 
 }  // namespace pgmem::net

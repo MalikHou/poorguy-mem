@@ -2,13 +2,18 @@
 
 #include <string>
 
+#include "pgmem/config/defaults.h"
+
 namespace pgmem::install {
 
 struct InstallOptions {
     std::string workspace_root;
-    std::string mcp_url{"http://127.0.0.1:8765/mcp"};
-    std::string mcp_name{"poorguy-mem"};
+    std::string mcp_url{config::kDefaultMcpUrl};
+    std::string mcp_name{config::kDefaultMcpName};
     std::string pgmemd_bin{"pgmemd"};
+    std::string pgmemd_extra_args;
+    int core_number{config::kDefaultCoreNumber};
+    bool enable_io_uring_network_engine{config::kDefaultEnableIoUringNetworkEngine};
     bool configure_codex{true};
     bool manage_systemd{true};
 };

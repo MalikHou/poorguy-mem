@@ -4,7 +4,7 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=%h/.local/bin/pgmemd --host 127.0.0.1 --port 8765 --store-backend eloqstore --store-threads 0 --store-root %h/.pgmem/store --node-id local
+ExecStart=%h/.local/bin/pgmemd --host 127.0.0.1 --port 8765 --store-backend eloqstore --core-number 0 --enable-io-uring-network-engine false --mem-budget-mb 512 --disk-budget-gb 20 --gc-high-watermark 0.90 --gc-low-watermark 0.75 --gc-batch-size 256 --max-record-bytes 131072 --enable-tombstone-gc true --shutdown-drain-timeout-ms 3000 --store-root %h/.pgmem/store
 Restart=on-failure
 RestartSec=2
 

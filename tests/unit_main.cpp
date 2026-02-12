@@ -1,7 +1,7 @@
-#include "test_framework.h"
-
 #include <exception>
 #include <iostream>
+
+#include "test_framework.h"
 
 std::vector<TestCase>& TestRegistry() {
     static std::vector<TestCase> tests;

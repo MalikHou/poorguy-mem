@@ -1,8 +1,7 @@
 #include "pgmem/util/json.h"
 
-#include <sstream>
-
 #include <boost/property_tree/json_parser.hpp>
+#include <sstream>
 
 namespace pgmem::util {
 
@@ -59,16 +58,12 @@ std::string GetStringOr(const Json& json, const std::string& path, const std::st
     return json.get<std::string>(path, fallback);
 }
 
-int GetIntOr(const Json& json, const std::string& path, int fallback) {
-    return json.get<int>(path, fallback);
-}
+int GetIntOr(const Json& json, const std::string& path, int fallback) { return json.get<int>(path, fallback); }
 
 uint64_t GetUint64Or(const Json& json, const std::string& path, uint64_t fallback) {
     return json.get<uint64_t>(path, fallback);
 }
 
-bool GetBoolOr(const Json& json, const std::string& path, bool fallback) {
-    return json.get<bool>(path, fallback);
-}
+bool GetBoolOr(const Json& json, const std::string& path, bool fallback) { return json.get<bool>(path, fallback); }
 
 }  // namespace pgmem::util
