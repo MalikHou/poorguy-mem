@@ -2,8 +2,10 @@
 #include <butil/third_party/rapidjson/stringbuffer.h>
 #include <butil/third_party/rapidjson/writer.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <cerrno>
 #include <chrono>
 #include <csignal>
 #include <cstdint>
@@ -11,6 +13,7 @@
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -30,6 +33,7 @@ namespace {
 namespace rj = BUTIL_RAPIDJSON_NAMESPACE;
 
 std::atomic<bool> g_running{true};
+constexpr const char* kIoUringUnavailablePrefix = "[pgmemd] io_uring unavailable for eloqstore backend: ";
 
 void OnSignal(int) { g_running.store(false); }
 
@@ -128,11 +132,59 @@ std::string JsonRpcResult(const std::string& id_literal, const std::string& resu
 }
 
 std::string InitializeResultJson() {
-    return R"({"protocolVersion":"2024-11-05","capabilities":{"tools":{"listChanged":false}},"serverInfo":{"name":"poorguy-mem","version":"1.0.0"},"instructions":"Use tools memory.bootstrap/search/commit_turn/pin/stats/compact. Call memory.describe for full schema."})";
+    return R"({"protocolVersion":"2024-11-05","capabilities":{"tools":{"listChanged":false}},"serverInfo":{"name":"poorguy-mem","version":"2.0.0"},"instructions":"Use tools memory.write/query/pin/stats/compact. Call memory.describe for full schema."})";
 }
 
-std::string ToolsListResultJson() {
-    return R"({"tools":[{"name":"memory.describe","description":"Return full memory API contract including semantics, input schema, output schema, and error contract.","inputSchema":{"type":"object","properties":{"include_examples":{"type":"boolean"}}}},{"name":"memory.bootstrap","description":"Bootstrap session context by recalling relevant memory and summary.","inputSchema":{"type":"object","properties":{"workspace_id":{"type":"string"},"session_id":{"type":"string"},"task_text":{"type":"string"},"open_files":{"type":"array","items":{"type":"string"}},"token_budget":{"type":"integer"}}}},{"name":"memory.commit_turn","description":"Persist one conversation turn into memory.","inputSchema":{"type":"object","properties":{"workspace_id":{"type":"string"},"session_id":{"type":"string"},"user_text":{"type":"string"},"assistant_text":{"type":"string"},"code_snippets":{"type":"array","items":{"type":"string"}},"commands":{"type":"array","items":{"type":"string"}}}}},{"name":"memory.search","description":"Search memory using lexical and semantic ranking.","inputSchema":{"type":"object","properties":{"workspace_id":{"type":"string"},"query":{"type":"string"},"top_k":{"type":"integer"},"token_budget":{"type":"integer"}}}},{"name":"memory.pin","description":"Pin or unpin a memory record.","inputSchema":{"type":"object","properties":{"workspace_id":{"type":"string"},"memory_id":{"type":"string"},"pin":{"type":"boolean"}},"required":["memory_id"]}},{"name":"memory.stats","description":"Return runtime stats including effective backend and pending accepted writes.","inputSchema":{"type":"object","properties":{"workspace_id":{"type":"string"},"window":{"type":"string"}}}},{"name":"memory.compact","description":"Trigger compaction and return compaction counters.","inputSchema":{"type":"object","properties":{"workspace_id":{"type":"string"}}}}]})";
+const pgmem::util::Json* FindMethodSpec(const pgmem::util::Json& methods, const std::string& method_name) {
+    for (const auto& node : methods) {
+        if (node.first == method_name) {
+            return &node.second;
+        }
+    }
+    return nullptr;
+}
+
+std::string ToolsListResultJson(pgmem::mcp::McpDispatcher* dispatcher) {
+    if (dispatcher == nullptr) {
+        return R"({"tools":[]})";
+    }
+
+    const auto describe = dispatcher->Describe();
+    const auto method_names_opt = describe.get_child_optional("method_names");
+    const auto methods_opt = describe.get_child_optional("methods");
+
+    pgmem::util::Json tools;
+    if (method_names_opt && methods_opt) {
+        for (const auto& method_name_node : *method_names_opt) {
+            const std::string method_name = method_name_node.second.get_value<std::string>();
+            if (method_name.rfind("memory.", 0) != 0) {
+                continue;
+            }
+
+            const pgmem::util::Json* method_spec = FindMethodSpec(*methods_opt, method_name);
+            if (method_spec == nullptr) {
+                continue;
+            }
+
+            pgmem::util::Json tool;
+            tool.put("name", method_name);
+            tool.put("description", pgmem::util::GetStringOr(*method_spec, "summary", ""));
+
+            if (const auto input_schema_opt = method_spec->get_child_optional("input_schema")) {
+                tool.add_child("inputSchema", *input_schema_opt);
+            } else {
+                pgmem::util::Json empty_schema;
+                empty_schema.put("type", "object");
+                tool.add_child("inputSchema", empty_schema);
+            }
+
+            tools.push_back(std::make_pair("", tool));
+        }
+    }
+
+    pgmem::util::Json out;
+    out.add_child("tools", tools);
+    return pgmem::util::ToJsonString(out, false);
 }
 
 std::string ToolCallResultJson(const std::string& text, bool is_error) {
@@ -149,6 +201,345 @@ std::string PtreeChildToJson(const pgmem::util::Json& json, const std::string& p
         return pgmem::util::ToJsonString(*child_opt, false);
     }
     return "{}";
+}
+
+bool ParseBoolLiteral(const char* text, bool* out) {
+    if (text == nullptr || out == nullptr) {
+        return false;
+    }
+    std::string lowered(text);
+    for (char& c : lowered) {
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    if (lowered == "true" || lowered == "1") {
+        *out = true;
+        return true;
+    }
+    if (lowered == "false" || lowered == "0") {
+        *out = false;
+        return true;
+    }
+    return false;
+}
+
+bool ParseInt64Literal(const char* text, int64_t* out) {
+    if (text == nullptr || out == nullptr) {
+        return false;
+    }
+    errno       = 0;
+    char* end   = nullptr;
+    long long v = std::strtoll(text, &end, 10);
+    if (errno != 0 || end == text || (end != nullptr && *end != '\0')) {
+        return false;
+    }
+    *out = static_cast<int64_t>(v);
+    return true;
+}
+
+bool ParseDoubleLiteral(const char* text, double* out) {
+    if (text == nullptr || out == nullptr) {
+        return false;
+    }
+    errno     = 0;
+    char* end = nullptr;
+    double v  = std::strtod(text, &end);
+    if (errno != 0 || end == text || (end != nullptr && *end != '\0')) {
+        return false;
+    }
+    *out = v;
+    return true;
+}
+
+void ConvertValueToBoolIfString(rj::Value* value) {
+    if (value == nullptr || !value->IsString()) {
+        return;
+    }
+    bool parsed = false;
+    if (ParseBoolLiteral(value->GetString(), &parsed)) {
+        value->SetBool(parsed);
+    }
+}
+
+void ConvertValueToIntIfString(rj::Value* value) {
+    if (value == nullptr || !value->IsString()) {
+        return;
+    }
+    int64_t parsed = 0;
+    if (ParseInt64Literal(value->GetString(), &parsed)) {
+        value->SetInt64(parsed);
+    }
+}
+
+void ConvertValueToDoubleIfString(rj::Value* value) {
+    if (value == nullptr || !value->IsString()) {
+        return;
+    }
+    double parsed = 0.0;
+    if (ParseDoubleLiteral(value->GetString(), &parsed)) {
+        value->SetDouble(parsed);
+    }
+}
+
+rj::Value* FindMemberObject(rj::Value* value, const char* key) {
+    if (value == nullptr || key == nullptr || !value->IsObject() || !value->HasMember(key)) {
+        return nullptr;
+    }
+    return &(*value)[key];
+}
+
+void EnsureArrayMember(rj::Value* object, const char* key, rj::Document::AllocatorType& alloc) {
+    if (object == nullptr || key == nullptr || !object->IsObject() || !object->HasMember(key)) {
+        return;
+    }
+
+    rj::Value& field = (*object)[key];
+    if (field.IsArray()) {
+        return;
+    }
+
+    if (field.IsString() && field.GetStringLength() == 0) {
+        field.SetArray();
+        return;
+    }
+
+    if (field.IsString()) {
+        std::string copy = field.GetString();
+        field.SetArray();
+        rj::Value str;
+        str.SetString(copy.c_str(), static_cast<rj::SizeType>(copy.size()), alloc);
+        field.PushBack(str, alloc);
+    }
+}
+
+void EnsureObjectMember(rj::Value* object, const char* key) {
+    if (object == nullptr || key == nullptr || !object->IsObject() || !object->HasMember(key)) {
+        return;
+    }
+
+    rj::Value& field = (*object)[key];
+    if (field.IsObject()) {
+        return;
+    }
+    if (field.IsString() && field.GetStringLength() == 0) {
+        field.SetObject();
+    }
+}
+
+void NormalizeSchemaDefaultByType(rj::Value* node) {
+    if (node == nullptr || !node->IsObject() || !node->HasMember("type") || !node->HasMember("default")) {
+        return;
+    }
+    const rj::Value& type = (*node)["type"];
+    if (!type.IsString()) {
+        return;
+    }
+
+    rj::Value& default_value = (*node)["default"];
+    const std::string type_name = type.GetString();
+    if (type_name == "boolean") {
+        ConvertValueToBoolIfString(&default_value);
+    } else if (type_name == "integer") {
+        ConvertValueToIntIfString(&default_value);
+    } else if (type_name == "number") {
+        ConvertValueToDoubleIfString(&default_value);
+    }
+}
+
+void NormalizeDescribeNode(rj::Value* node) {
+    if (node == nullptr) {
+        return;
+    }
+    if (node->IsObject()) {
+        if (node->HasMember("additionalProperties")) {
+            ConvertValueToBoolIfString(&(*node)["additionalProperties"]);
+        }
+        NormalizeSchemaDefaultByType(node);
+        for (auto it = node->MemberBegin(); it != node->MemberEnd(); ++it) {
+            const std::string key = it->name.GetString();
+            if (key == "generated_at_ms" || key == "code" || key == "status") {
+                ConvertValueToIntIfString(&it->value);
+            } else if (key == "sync_routes_available") {
+                ConvertValueToBoolIfString(&it->value);
+            }
+            NormalizeDescribeNode(&it->value);
+        }
+        return;
+    }
+    if (node->IsArray()) {
+        for (auto it = node->Begin(); it != node->End(); ++it) {
+            NormalizeDescribeNode(&(*it));
+        }
+    }
+}
+
+void NormalizeQueryResult(rj::Value* result, rj::Document::AllocatorType& alloc) {
+    if (result == nullptr || !result->IsObject()) {
+        return;
+    }
+
+    EnsureArrayMember(result, "hits", alloc);
+    rj::Value* hits = FindMemberObject(result, "hits");
+    if (hits != nullptr && hits->IsArray()) {
+        for (auto it = hits->Begin(); it != hits->End(); ++it) {
+            rj::Value& hit = *it;
+            if (!hit.IsObject()) {
+                continue;
+            }
+            EnsureArrayMember(&hit, "tags", alloc);
+            EnsureObjectMember(&hit, "metadata");
+            ConvertValueToIntIfString(FindMemberObject(&hit, "updated_at_ms"));
+            ConvertValueToBoolIfString(FindMemberObject(&hit, "pinned"));
+
+            rj::Value* scores = FindMemberObject(&hit, "scores");
+            if (scores != nullptr && scores->IsObject()) {
+                ConvertValueToDoubleIfString(FindMemberObject(scores, "sparse"));
+                ConvertValueToDoubleIfString(FindMemberObject(scores, "dense"));
+                ConvertValueToDoubleIfString(FindMemberObject(scores, "freshness"));
+                ConvertValueToDoubleIfString(FindMemberObject(scores, "pin"));
+                ConvertValueToDoubleIfString(FindMemberObject(scores, "final"));
+            }
+        }
+    }
+
+    rj::Value* debug = FindMemberObject(result, "debug_stats");
+    if (debug != nullptr && debug->IsObject()) {
+        ConvertValueToIntIfString(FindMemberObject(debug, "sparse_candidates"));
+        ConvertValueToIntIfString(FindMemberObject(debug, "dense_candidates"));
+        ConvertValueToIntIfString(FindMemberObject(debug, "merged_candidates"));
+
+        rj::Value* latency = FindMemberObject(debug, "latency_ms");
+        if (latency != nullptr && latency->IsObject()) {
+            ConvertValueToDoubleIfString(FindMemberObject(latency, "sparse"));
+            ConvertValueToDoubleIfString(FindMemberObject(latency, "dense"));
+            ConvertValueToDoubleIfString(FindMemberObject(latency, "rerank"));
+            ConvertValueToDoubleIfString(FindMemberObject(latency, "total"));
+        }
+    }
+}
+
+void NormalizeResultByMethod(rj::Value* result, const std::string& method, rj::Document::AllocatorType& alloc) {
+    if (result == nullptr || !result->IsObject()) {
+        return;
+    }
+
+    if (method == "memory.write") {
+        ConvertValueToBoolIfString(FindMemberObject(result, "ok"));
+        ConvertValueToIntIfString(FindMemberObject(result, "index_generation"));
+        EnsureArrayMember(result, "stored_ids", alloc);
+        EnsureArrayMember(result, "deduped_ids", alloc);
+        EnsureArrayMember(result, "warnings", alloc);
+        return;
+    }
+
+    if (method == "memory.query") {
+        NormalizeQueryResult(result, alloc);
+        return;
+    }
+
+    if (method == "memory.pin") {
+        ConvertValueToBoolIfString(FindMemberObject(result, "ok"));
+        return;
+    }
+
+    if (method == "memory.stats") {
+        ConvertValueToDoubleIfString(FindMemberObject(result, "p95_read_ms"));
+        ConvertValueToDoubleIfString(FindMemberObject(result, "p95_write_ms"));
+        ConvertValueToDoubleIfString(FindMemberObject(result, "token_reduction_ratio"));
+        ConvertValueToDoubleIfString(FindMemberObject(result, "fallback_rate"));
+        ConvertValueToIntIfString(FindMemberObject(result, "mem_used_bytes"));
+        ConvertValueToIntIfString(FindMemberObject(result, "disk_used_bytes"));
+        ConvertValueToIntIfString(FindMemberObject(result, "resident_used_bytes"));
+        ConvertValueToIntIfString(FindMemberObject(result, "resident_limit_bytes"));
+        ConvertValueToIntIfString(FindMemberObject(result, "resident_evicted_count"));
+        ConvertValueToIntIfString(FindMemberObject(result, "disk_fallback_search_count"));
+        ConvertValueToIntIfString(FindMemberObject(result, "item_count"));
+        ConvertValueToIntIfString(FindMemberObject(result, "tombstone_count"));
+        ConvertValueToIntIfString(FindMemberObject(result, "gc_last_run_ms"));
+        ConvertValueToIntIfString(FindMemberObject(result, "gc_evicted_count"));
+        ConvertValueToBoolIfString(FindMemberObject(result, "capacity_blocked"));
+
+        rj::Value* index_stats = FindMemberObject(result, "index_stats");
+        if (index_stats != nullptr && index_stats->IsObject()) {
+            ConvertValueToIntIfString(FindMemberObject(index_stats, "segment_count"));
+            ConvertValueToIntIfString(FindMemberObject(index_stats, "posting_terms"));
+            ConvertValueToIntIfString(FindMemberObject(index_stats, "vector_count"));
+            ConvertValueToDoubleIfString(FindMemberObject(index_stats, "query_cache_hit_rate"));
+            ConvertValueToDoubleIfString(FindMemberObject(index_stats, "dense_probe_count_p95"));
+            ConvertValueToIntIfString(FindMemberObject(index_stats, "cold_rehydrate_count"));
+        }
+        return;
+    }
+
+    if (method == "memory.compact") {
+        ConvertValueToBoolIfString(FindMemberObject(result, "triggered"));
+        ConvertValueToBoolIfString(FindMemberObject(result, "capacity_blocked"));
+        ConvertValueToIntIfString(FindMemberObject(result, "mem_before_bytes"));
+        ConvertValueToIntIfString(FindMemberObject(result, "disk_before_bytes"));
+        ConvertValueToIntIfString(FindMemberObject(result, "mem_after_bytes"));
+        ConvertValueToIntIfString(FindMemberObject(result, "disk_after_bytes"));
+        ConvertValueToIntIfString(FindMemberObject(result, "summarized_count"));
+        ConvertValueToIntIfString(FindMemberObject(result, "tombstoned_count"));
+        ConvertValueToIntIfString(FindMemberObject(result, "deleted_count"));
+        ConvertValueToIntIfString(FindMemberObject(result, "segments_before"));
+        ConvertValueToIntIfString(FindMemberObject(result, "segments_after"));
+        ConvertValueToIntIfString(FindMemberObject(result, "postings_reclaimed"));
+        ConvertValueToIntIfString(FindMemberObject(result, "vectors_reclaimed"));
+        return;
+    }
+
+    if (method == "store.compact") {
+        ConvertValueToBoolIfString(FindMemberObject(result, "triggered"));
+        ConvertValueToBoolIfString(FindMemberObject(result, "noop"));
+        ConvertValueToBoolIfString(FindMemberObject(result, "busy"));
+        ConvertValueToBoolIfString(FindMemberObject(result, "async"));
+        ConvertValueToIntIfString(FindMemberObject(result, "partition_count"));
+        return;
+    }
+
+    if (method == "memory.describe") {
+        NormalizeDescribeNode(result);
+        return;
+    }
+
+    if (method == "tools.list") {
+        NormalizeDescribeNode(result);
+    }
+}
+
+std::string NormalizeMcpResponseJson(const std::string& raw_json, const std::string& method) {
+    rj::Document doc;
+    doc.Parse(raw_json.c_str());
+    if (doc.HasParseError() || !doc.IsObject()) {
+        return raw_json;
+    }
+
+    ConvertValueToIntIfString(FindMemberObject(&doc, "id"));
+    NormalizeResultByMethod(FindMemberObject(&doc, "result"), method, doc.GetAllocator());
+
+    rj::Value* error = FindMemberObject(&doc, "error");
+    if (error != nullptr && error->IsObject()) {
+        ConvertValueToIntIfString(FindMemberObject(error, "code"));
+    }
+
+    rj::StringBuffer buffer;
+    rj::Writer<rj::StringBuffer> writer(buffer);
+    doc.Accept(writer);
+    return buffer.GetString();
+}
+
+std::string NormalizeMcpResultJson(const std::string& raw_json, const std::string& method) {
+    rj::Document doc;
+    doc.Parse(raw_json.c_str());
+    if (doc.HasParseError() || !doc.IsObject()) {
+        return raw_json;
+    }
+
+    NormalizeResultByMethod(&doc, method, doc.GetAllocator());
+
+    rj::StringBuffer buffer;
+    rj::Writer<rj::StringBuffer> writer(buffer);
+    doc.Accept(writer);
+    return buffer.GetString();
 }
 
 pgmem::net::HttpResponse HandleMcpJsonRpc(const std::string& body, pgmem::mcp::McpDispatcher* dispatcher) {
@@ -197,7 +588,8 @@ pgmem::net::HttpResponse HandleMcpJsonRpc(const std::string& body, pgmem::mcp::M
     }
     if (method == "tools/list") {
         resp.status_code = 200;
-        resp.body        = JsonRpcResult(id_literal, ToolsListResultJson());
+        const std::string result_json = NormalizeMcpResultJson(ToolsListResultJson(dispatcher), "tools.list");
+        resp.body                     = JsonRpcResult(id_literal, result_json);
         return resp;
     }
     if (method == "tools/call") {
@@ -214,7 +606,7 @@ pgmem::net::HttpResponse HandleMcpJsonRpc(const std::string& body, pgmem::mcp::M
         }
 
         const std::string tool_name = params["name"].GetString();
-        if (tool_name.rfind("memory.", 0) != 0 && tool_name != "mcp.describe") {
+        if (tool_name.rfind("memory.", 0) != 0) {
             resp.status_code = 200;
             resp.body        = JsonRpcError(id_literal, -32601, "tool not found");
             return resp;
@@ -248,7 +640,7 @@ pgmem::net::HttpResponse HandleMcpJsonRpc(const std::string& body, pgmem::mcp::M
         return resp;
     }
 
-    if (method.rfind("memory.", 0) == 0 || method == "mcp.describe") {
+    if (method.rfind("memory.", 0) == 0 || method == "store.compact") {
         pgmem::util::Json mem_req;
         mem_req.put("id", "jsonrpc-call");
         mem_req.put("method", method);
@@ -278,25 +670,15 @@ pgmem::net::HttpResponse HandleMcpJsonRpc(const std::string& body, pgmem::mcp::M
             return resp;
         }
 
-        resp.status_code = 200;
-        resp.body        = JsonRpcResult(id_literal, PtreeChildToJson(out, "result"));
+        const std::string normalized_result = NormalizeMcpResultJson(PtreeChildToJson(out, "result"), method);
+        resp.status_code                    = 200;
+        resp.body                           = JsonRpcResult(id_literal, normalized_result);
         return resp;
     }
 
     resp.status_code = 200;
     resp.body        = JsonRpcError(id_literal, -32601, "method not found");
     return resp;
-}
-
-bool ParseBoolFlag(const std::string& value, bool fallback) {
-    const std::string v = ToLower(value);
-    if (v == "1" || v == "true" || v == "yes" || v == "on") {
-        return true;
-    }
-    if (v == "0" || v == "false" || v == "no" || v == "off") {
-        return false;
-    }
-    return fallback;
 }
 
 const char* DefaultStoreBackend() {
@@ -313,24 +695,15 @@ struct Args {
     std::string store_backend{DefaultStoreBackend()};
     std::string store_root{pgmem::config::kDefaultStoreRoot};
     int core_number{pgmem::config::kDefaultCoreNumber};
-    bool enable_io_uring_network_engine{pgmem::config::kDefaultEnableIoUringNetworkEngine};
-    bool append_mode{pgmem::config::kDefaultAppendMode};
-    bool enable_compression{pgmem::config::kDefaultEnableCompression};
     uint64_t mem_budget_mb{pgmem::config::kDefaultMemBudgetMb};
     uint64_t disk_budget_gb{pgmem::config::kDefaultDiskBudgetGb};
-    double gc_high_watermark{pgmem::config::kDefaultGcHighWatermark};
-    double gc_low_watermark{pgmem::config::kDefaultGcLowWatermark};
-    uint32_t gc_batch_size{pgmem::config::kDefaultGcBatchSize};
-    uint64_t max_record_bytes{pgmem::config::kDefaultMaxRecordBytes};
-    bool enable_tombstone_gc{pgmem::config::kDefaultEnableTombstoneGc};
-    uint32_t shutdown_drain_timeout_ms{pgmem::config::kDefaultShutdownDrainTimeoutMs};
+    bool test_force_io_uring_unavailable{false};
     bool invalid{false};
     std::string invalid_message;
 };
 
-void MarkRemovedFlag(Args* args, const std::string& key, const std::string& guidance) {
-    args->invalid         = true;
-    args->invalid_message = "flag " + key + " is removed; " + guidance;
+const char* AllowedPgmemdFlags() {
+    return "--host --port --store-backend --store-root --core-number --mem-budget-mb --disk-budget-gb";
 }
 
 Args ParseArgs(int argc, char** argv) {
@@ -347,71 +720,16 @@ Args ParseArgs(int argc, char** argv) {
             args.store_root = argv[++i];
         } else if (key == "--core-number" && i + 1 < argc) {
             args.core_number = std::atoi(argv[++i]);
-        } else if (key == "--enable-io-uring-network-engine" && i + 1 < argc) {
-            args.enable_io_uring_network_engine = ParseBoolFlag(argv[++i], args.enable_io_uring_network_engine);
-        } else if (key == "--append-mode" && i + 1 < argc) {
-            args.append_mode = ParseBoolFlag(argv[++i], args.append_mode);
-        } else if (key == "--enable-compression" && i + 1 < argc) {
-            args.enable_compression = ParseBoolFlag(argv[++i], args.enable_compression);
         } else if (key == "--mem-budget-mb" && i + 1 < argc) {
             args.mem_budget_mb = static_cast<uint64_t>(std::strtoull(argv[++i], nullptr, 10));
         } else if (key == "--disk-budget-gb" && i + 1 < argc) {
             args.disk_budget_gb = static_cast<uint64_t>(std::strtoull(argv[++i], nullptr, 10));
-        } else if (key == "--gc-high-watermark" && i + 1 < argc) {
-            args.gc_high_watermark = std::strtod(argv[++i], nullptr);
-        } else if (key == "--gc-low-watermark" && i + 1 < argc) {
-            args.gc_low_watermark = std::strtod(argv[++i], nullptr);
-        } else if (key == "--gc-batch-size" && i + 1 < argc) {
-            args.gc_batch_size = static_cast<uint32_t>(std::strtoul(argv[++i], nullptr, 10));
-        } else if (key == "--max-record-bytes" && i + 1 < argc) {
-            args.max_record_bytes = static_cast<uint64_t>(std::strtoull(argv[++i], nullptr, 10));
-        } else if (key == "--enable-tombstone-gc" && i + 1 < argc) {
-            args.enable_tombstone_gc = ParseBoolFlag(argv[++i], args.enable_tombstone_gc);
-        } else if (key == "--shutdown-drain-timeout-ms" && i + 1 < argc) {
-            args.shutdown_drain_timeout_ms = static_cast<uint32_t>(std::strtoul(argv[++i], nullptr, 10));
-        } else if (key == "--event-dispatcher-num") {
-            if (i + 1 < argc) {
-                ++i;
-            }
-            MarkRemovedFlag(&args, key, "event_dispatcher_num now follows core-number automatically");
-        } else if (key == "--store-partitions") {
-            if (i + 1 < argc) {
-                ++i;
-            }
-            MarkRemovedFlag(&args, key, "partitions are derived automatically as partitions=core-number");
-        } else if (key == "--allow-inmemory-fallback") {
-            if (i + 1 < argc) {
-                ++i;
-            }
-            MarkRemovedFlag(&args, key, "eloqstore init failure now always downgrades to inmemory");
-        } else if (key == "--write-ack-mode") {
-            if (i + 1 < argc) {
-                ++i;
-            }
-            MarkRemovedFlag(&args, key, "write_ack_mode is fixed to accepted in local mode");
-        } else if (key == "--volatile-flush-interval-ms" || key == "--volatile-max-pending-ops") {
-            if (i + 1 < argc) {
-                ++i;
-            }
-            MarkRemovedFlag(&args, key, "volatile queue tuning is internal-only in local mode");
-        } else if (key == "--node-id") {
-            if (i + 1 < argc) {
-                ++i;
-            }
-            MarkRemovedFlag(&args, key, "node-id is fixed to local for single-node mode");
-        } else if (key == "--sync-host" || key == "--sync-port") {
-            if (i + 1 < argc) {
-                ++i;
-            }
-            MarkRemovedFlag(&args, key, "sync flags are removed in single-node local mode");
-        } else if (key.rfind("--s3-", 0) == 0) {
-            if (i + 1 < argc) {
-                ++i;
-            }
-            MarkRemovedFlag(&args, key, "S3 backend options are removed from local mode");
+        } else if (key == "--test-force-io-uring-unavailable") {
+            args.test_force_io_uring_unavailable = true;
         } else {
             args.invalid         = true;
-            args.invalid_message = "unknown argument: " + key;
+            args.invalid_message = "unknown argument: " + key + "; allowed flags: " + AllowedPgmemdFlags();
+            break;
         }
     }
     return args;
@@ -427,9 +745,8 @@ int main(int argc, char** argv) {
     }
 
     pgmem::net::BrpcRuntimeOptions runtime_options;
-    runtime_options.core_number                    = args.core_number;
-    runtime_options.event_dispatcher_num           = 0;
-    runtime_options.enable_io_uring_network_engine = args.enable_io_uring_network_engine;
+    runtime_options.core_number          = args.core_number;
+    runtime_options.event_dispatcher_num = 0;
 
     pgmem::net::BrpcRuntimeState runtime_state;
     std::string error;
@@ -437,7 +754,7 @@ int main(int argc, char** argv) {
         std::cerr << "[pgmemd] failed to apply brpc runtime options: " << error << "\n";
         return 2;
     }
-    if (runtime_state.resolved_core_number > static_cast<int>(std::numeric_limits<uint16_t>::max())) {
+    if (args.core_number > static_cast<int>(std::numeric_limits<uint16_t>::max())) {
         std::cerr << "[pgmemd] core_number is too large for eloqstore num_threads\n";
         return 2;
     }
@@ -446,86 +763,71 @@ int main(int argc, char** argv) {
     std::signal(SIGTERM, OnSignal);
 
     pgmem::store::StoreAdapterConfig store_config;
-    store_config.backend             = args.store_backend;
-    store_config.root_path           = args.store_root;
-    store_config.num_threads         = static_cast<uint16_t>(runtime_state.resolved_core_number);
-    store_config.num_partitions      = static_cast<uint32_t>(runtime_state.resolved_core_number);
-    store_config.append_mode         = args.append_mode;
-    store_config.enable_compression  = args.enable_compression;
-    store_config.mem_budget_mb       = args.mem_budget_mb;
-    store_config.disk_budget_gb      = args.disk_budget_gb;
-    store_config.gc_high_watermark   = args.gc_high_watermark;
-    store_config.gc_low_watermark    = args.gc_low_watermark;
-    store_config.gc_batch_size       = args.gc_batch_size;
-    store_config.max_record_bytes    = args.max_record_bytes;
-    store_config.enable_tombstone_gc = args.enable_tombstone_gc;
+    store_config.backend        = args.store_backend;
+    store_config.root_path      = args.store_root;
+    store_config.num_threads    = static_cast<uint16_t>(args.core_number);
+    store_config.num_partitions = static_cast<uint32_t>(args.core_number);
+    store_config.mem_budget_mb  = args.mem_budget_mb;
+    store_config.disk_budget_gb = args.disk_budget_gb;
 
     const std::string requested_backend = ToLower(store_config.backend);
     if (requested_backend == "eloqstore") {
         std::string probe_error;
-        if (!pgmem::store::IsIoUringAvailable(&probe_error)) {
-            std::cerr << "[pgmemd] warning: eloqstore storage io_uring probe failed: " << probe_error << "\n";
-            std::cerr << "[pgmemd] warning: auto-downgrading backend to in-memory\n";
-            store_config.backend = "inmemory";
+        if (!pgmem::store::IsIoUringAvailable(&probe_error, args.test_force_io_uring_unavailable)) {
+            std::cerr << kIoUringUnavailablePrefix << probe_error << "\n";
+            return 1;
         }
     }
 
     std::unique_ptr<pgmem::store::IStoreAdapter> store = pgmem::store::CreateStoreAdapter(store_config, &error);
     if (!store) {
-        const std::string backend = ToLower(store_config.backend);
-        if (backend == "eloqstore") {
-            std::cerr << "[pgmemd] failed to initialize eloqstore backend: " << error
-                      << ", auto-downgrading to in-memory\n";
-            store_config.backend = "inmemory";
-            store                = pgmem::store::CreateInMemoryStoreAdapter();
-        } else {
-            std::cerr << "[pgmemd] failed to initialize backend '" << store_config.backend << "': " << error << "\n";
-            return 1;
-        }
+        std::cerr << "[pgmemd] failed to initialize backend '" << store_config.backend << "': " << error << "\n";
+        return 1;
     }
 
     const std::string effective_backend = ToLower(store_config.backend);
     std::cerr << "[pgmemd] runtime: core_number=" << runtime_state.resolved_core_number
               << " event_dispatcher_num=" << runtime_state.resolved_event_dispatcher_num
+              << " store_threads=" << store_config.num_threads << " store_partitions=" << store_config.num_partitions
               << " network_io_uring=" << (runtime_state.network_io_uring_enabled ? "true" : "false")
-              << " backend=" << effective_backend << " write_ack_mode=accepted\n";
+              << " backend=" << effective_backend << " write_ack_mode=durable\n";
 
     auto retriever = pgmem::core::CreateHybridRetriever();
 
     pgmem::core::MemoryEngineOptions engine_options;
-    engine_options.mem_budget_mb              = args.mem_budget_mb;
-    engine_options.disk_budget_gb             = args.disk_budget_gb;
-    engine_options.gc_high_watermark          = args.gc_high_watermark;
-    engine_options.gc_low_watermark           = args.gc_low_watermark;
-    engine_options.gc_batch_size              = args.gc_batch_size;
-    engine_options.max_record_bytes           = args.max_record_bytes;
-    engine_options.enable_tombstone_gc        = args.enable_tombstone_gc;
-    engine_options.write_ack_mode             = pgmem::core::WriteAckMode::Accepted;
-    engine_options.volatile_flush_interval_ms = pgmem::config::kDefaultVolatileFlushIntervalMs;
-    engine_options.volatile_max_pending_ops   = pgmem::config::kDefaultVolatileMaxPendingOps;
-    engine_options.shutdown_drain_timeout_ms  = args.shutdown_drain_timeout_ms;
-    engine_options.effective_backend          = effective_backend;
+    engine_options.mem_budget_mb     = args.mem_budget_mb;
+    engine_options.disk_budget_gb    = args.disk_budget_gb;
+    engine_options.effective_backend = effective_backend;
 
     pgmem::core::MemoryEngine engine(std::move(store), std::move(retriever), pgmem::config::kDefaultNodeIdLocal,
                                      engine_options);
-    if (!engine.Warmup(&error)) {
-        std::cerr << "[pgmemd] warmup failed: " << error << "\n";
-        return 1;
-    }
+    std::atomic<bool> ready{false};
 
     pgmem::mcp::McpDispatcher dispatcher(&engine);
 
     pgmem::net::HttpServerOptions server_options;
     server_options.num_threads = runtime_state.resolved_core_number;
     pgmem::net::HttpServer server(args.host, args.port, server_options);
-    server.RegisterRoute("GET", "/health", [](const pgmem::net::HttpRequest&) {
+    server.RegisterRoute("GET", "/health", [&](const pgmem::net::HttpRequest&) {
         pgmem::net::HttpResponse resp;
+        if (!ready.load(std::memory_order_acquire)) {
+            resp.status_code = 503;
+            resp.body        = "{\"status\":\"starting\"}";
+            return resp;
+        }
         resp.status_code = 200;
         resp.body        = "{\"status\":\"ok\"}";
         return resp;
     });
 
     server.RegisterRoute("POST", "/mcp", [&](const pgmem::net::HttpRequest& req) {
+        if (!ready.load(std::memory_order_acquire)) {
+            pgmem::net::HttpResponse resp;
+            resp.status_code = 503;
+            resp.body        = "{\"error\":\"server is warming up\"}";
+            return resp;
+        }
+
         auto rpc_resp = HandleMcpJsonRpc(req.body, &dispatcher);
         if (rpc_resp.status_code != 0) {
             return rpc_resp;
@@ -540,16 +842,22 @@ int main(int argc, char** argv) {
             return resp;
         }
 
-        const auto out   = dispatcher.Handle(json);
-        resp.status_code = 200;
-        resp.body        = pgmem::util::ToJsonString(out, false);
+        const auto out           = dispatcher.Handle(json);
+        resp.status_code         = 200;
+        const std::string method = pgmem::util::GetStringOr(json, "method", "");
+        resp.body                = NormalizeMcpResponseJson(pgmem::util::ToJsonString(out, false), method);
         return resp;
     });
 
     server.RegisterRoute("GET", "/mcp/describe", [&](const pgmem::net::HttpRequest&) {
         pgmem::net::HttpResponse resp;
+        if (!ready.load(std::memory_order_acquire)) {
+            resp.status_code = 503;
+            resp.body        = "{\"error\":\"server is warming up\"}";
+            return resp;
+        }
         resp.status_code = 200;
-        resp.body        = pgmem::util::ToJsonString(dispatcher.Describe(), false);
+        resp.body = NormalizeMcpResultJson(pgmem::util::ToJsonString(dispatcher.Describe(), false), "memory.describe");
         return resp;
     });
 
@@ -557,6 +865,13 @@ int main(int argc, char** argv) {
         std::cerr << "[pgmemd] start failed: " << error << "\n";
         return 1;
     }
+
+    if (!engine.Warmup(&error)) {
+        std::cerr << "[pgmemd] warmup failed: " << error << "\n";
+        server.Stop();
+        return 1;
+    }
+    ready.store(true, std::memory_order_release);
 
     std::cerr << "[pgmemd] listening on http://" << args.host << ":" << args.port << "/mcp\n";
 

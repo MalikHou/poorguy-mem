@@ -4,6 +4,6 @@
 
 namespace pgmem::store {
 
-bool IsIoUringAvailable(std::string* error);
+bool IsIoUringAvailable(std::string* error, bool force_unavailable = false);
 
 }  // namespace pgmem::store

@@ -5,9 +5,8 @@
 
 TEST_CASE(test_brpc_runtime_event_dispatcher_follows_core) {
     pgmem::net::BrpcRuntimeOptions options;
-    options.core_number                    = 4;
-    options.event_dispatcher_num           = 0;
-    options.enable_io_uring_network_engine = false;
+    options.core_number          = 4;
+    options.event_dispatcher_num = 0;
 
     pgmem::net::BrpcRuntimeState state;
     std::string error;
@@ -15,14 +14,13 @@ TEST_CASE(test_brpc_runtime_event_dispatcher_follows_core) {
     ASSERT_TRUE(error.empty());
     ASSERT_EQ(state.resolved_core_number, 4);
     ASSERT_EQ(state.resolved_event_dispatcher_num, state.resolved_core_number);
-    ASSERT_TRUE(!state.network_io_uring_enabled);
+    ASSERT_TRUE(state.network_io_uring_enabled);
 }
 
 TEST_CASE(test_brpc_runtime_explicit_event_dispatcher_override) {
     pgmem::net::BrpcRuntimeOptions options;
-    options.core_number                    = 2;
-    options.event_dispatcher_num           = 5;
-    options.enable_io_uring_network_engine = true;
+    options.core_number          = 2;
+    options.event_dispatcher_num = 5;
 
     pgmem::net::BrpcRuntimeState state;
     std::string error;

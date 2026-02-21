@@ -1,11 +1,13 @@
 #include "pgmem/core/retriever.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
-#include <limits>
+#include <cstdint>
 #include <mutex>
+#include <unordered_set>
 
-#include "pgmem/util/text.h"
+#include "pgmem/util/time.h"
 
 namespace pgmem::core {
 namespace {
@@ -23,182 +25,357 @@ std::unordered_map<std::string, size_t> BuildDocumentFrequency(const DocMap& doc
     return df;
 }
 
+uint64_t EstimateRecordBytes(const MemoryRecord& record) {
+    uint64_t bytes = 0;
+    bytes += static_cast<uint64_t>(record.id.size());
+    bytes += static_cast<uint64_t>(record.workspace_id.size());
+    bytes += static_cast<uint64_t>(record.session_id.size());
+    bytes += static_cast<uint64_t>(record.source.size());
+    bytes += static_cast<uint64_t>(record.content.size());
+    bytes += static_cast<uint64_t>(record.node_id.size());
+    bytes += static_cast<uint64_t>(record.tier.size());
+    bytes += static_cast<uint64_t>(record.dedup_key.size());
+    bytes += static_cast<uint64_t>(record.shard_id.size());
+    bytes += static_cast<uint64_t>(record.replica_role.size());
+    bytes += static_cast<uint64_t>(record.shard_hint.size());
+    for (const auto& tag : record.tags) {
+        bytes += static_cast<uint64_t>(tag.size());
+    }
+    for (const auto& kv : record.metadata) {
+        bytes += static_cast<uint64_t>(kv.first.size() + kv.second.size());
+    }
+    bytes += 320;
+    return bytes;
+}
+
+double Normalize(double value, double max_value) {
+    if (value <= 0.0 || max_value <= 0.0) {
+        return 0.0;
+    }
+    return value / max_value;
+}
+
 }  // namespace
 
-HybridRetriever::HybridRetriever(size_t embedding_dim) : embedding_dim_(embedding_dim) {}
+HybridRetriever::HybridRetriever(size_t embedding_dim, std::unique_ptr<IAnalyzer> analyzer,
+                                 std::unique_ptr<IEmbeddingProvider> embedding,
+                                 std::unique_ptr<IVectorIndex> vector_index)
+    : embedding_dim_(embedding_dim),
+      analyzer_(std::move(analyzer)),
+      embedding_(std::move(embedding)),
+      vector_index_(std::move(vector_index)) {}
 
 void HybridRetriever::Index(const MemoryRecord& record) {
+    if (record.tombstone) {
+        Remove(record.workspace_id, record.id);
+        return;
+    }
+
     IndexedDoc doc;
     doc.record        = record;
-    const auto tokens = util::Tokenize(record.content);
-    for (const std::string& token : tokens) {
+    const auto tokens = analyzer_->Tokenize(record.content);
+    for (const auto& token : tokens) {
         ++doc.tf[token];
     }
     doc.doc_len   = tokens.size();
-    doc.embedding = Embed(record.content);
+    doc.embedding = embedding_->Embed(record.content, embedding_dim_);
 
-    std::unique_lock<std::shared_mutex> lock(mu_);
-    const auto old_it = snapshots_.find(record.workspace_id);
-    std::shared_ptr<const WorkspaceSnapshot> old_snapshot;
-    if (old_it != snapshots_.end()) {
-        old_snapshot = old_it->second;
-    }
+    {
+        std::unique_lock<std::shared_mutex> lock(mu_);
 
-    auto next = std::make_shared<WorkspaceSnapshot>();
-    if (old_snapshot) {
-        next->docs          = old_snapshot->docs;
-        next->total_doc_len = old_snapshot->total_doc_len;
-    }
+        const auto old_it = snapshots_.find(record.workspace_id);
+        std::shared_ptr<const WorkspaceSnapshot> old_snapshot;
+        if (old_it != snapshots_.end()) {
+            old_snapshot = old_it->second;
+        }
 
-    const auto prev = next->docs.find(record.id);
-    if (prev != next->docs.end()) {
-        if (next->total_doc_len >= prev->second.doc_len) {
+        auto next = std::make_shared<WorkspaceSnapshot>();
+        if (old_snapshot) {
+            next->docs          = old_snapshot->docs;
+            next->total_doc_len = old_snapshot->total_doc_len;
+        }
+
+        const auto prev = next->docs.find(record.id);
+        if (prev != next->docs.end() && next->total_doc_len >= prev->second.doc_len) {
             next->total_doc_len -= prev->second.doc_len;
         }
-    }
-    next->docs[record.id] = std::move(doc);
-    next->total_doc_len += tokens.size();
 
-    next->df                        = BuildDocumentFrequency(next->docs);
-    snapshots_[record.workspace_id] = std::move(next);
+        next->docs[record.id] = doc;
+        next->total_doc_len += tokens.size();
+        next->df                        = BuildDocumentFrequency(next->docs);
+        snapshots_[record.workspace_id] = std::move(next);
+    }
+
+    vector_index_->Upsert(record.workspace_id, record.id, doc.embedding);
 }
 
 void HybridRetriever::Remove(const std::string& workspace_id, const std::string& memory_id) {
-    std::unique_lock<std::shared_mutex> lock(mu_);
-    auto old_it = snapshots_.find(workspace_id);
-    if (old_it == snapshots_.end() || !old_it->second) {
-        return;
+    {
+        std::unique_lock<std::shared_mutex> lock(mu_);
+
+        auto old_it = snapshots_.find(workspace_id);
+        if (old_it == snapshots_.end() || !old_it->second) {
+            vector_index_->Remove(workspace_id, memory_id);
+            return;
+        }
+
+        auto next         = std::make_shared<WorkspaceSnapshot>(*old_it->second);
+        const auto doc_it = next->docs.find(memory_id);
+        if (doc_it == next->docs.end()) {
+            vector_index_->Remove(workspace_id, memory_id);
+            return;
+        }
+
+        if (next->total_doc_len >= doc_it->second.doc_len) {
+            next->total_doc_len -= doc_it->second.doc_len;
+        }
+        next->docs.erase(doc_it);
+
+        if (next->docs.empty()) {
+            snapshots_.erase(old_it);
+        } else {
+            next->df                 = BuildDocumentFrequency(next->docs);
+            snapshots_[workspace_id] = std::move(next);
+        }
     }
 
-    auto next         = std::make_shared<WorkspaceSnapshot>(*old_it->second);
-    const auto doc_it = next->docs.find(memory_id);
-    if (doc_it == next->docs.end()) {
-        return;
-    }
-
-    if (next->total_doc_len >= doc_it->second.doc_len) {
-        next->total_doc_len -= doc_it->second.doc_len;
-    }
-    next->docs.erase(doc_it);
-
-    if (next->docs.empty()) {
-        snapshots_.erase(old_it);
-        return;
-    }
-
-    next->df                 = BuildDocumentFrequency(next->docs);
-    snapshots_[workspace_id] = std::move(next);
+    vector_index_->Remove(workspace_id, memory_id);
 }
 
-std::vector<SearchHit> HybridRetriever::Search(const SearchInput& input, bool* semantic_fallback_used) {
-    if (semantic_fallback_used != nullptr) {
-        *semantic_fallback_used = false;
-    }
+QueryOutput HybridRetriever::Query(const QueryInput& input) {
+    QueryOutput out;
 
     std::shared_ptr<const WorkspaceSnapshot> snapshot;
     {
         std::shared_lock<std::shared_mutex> lock(mu_);
         auto ws_it = snapshots_.find(input.workspace_id);
-        if (ws_it == snapshots_.end()) {
-            return {};
+        if (ws_it == snapshots_.end() || !ws_it->second || ws_it->second->docs.empty()) {
+            return out;
         }
         snapshot = ws_it->second;
     }
-    if (!snapshot || snapshot->docs.empty()) {
-        return {};
-    }
 
-    const auto query_tokens = util::Tokenize(input.query);
+    const auto all_start = std::chrono::steady_clock::now();
+
+    const auto query_tokens = analyzer_->Tokenize(input.query);
     std::unordered_map<std::string, int> query_tf;
-    for (const std::string& token : query_tokens) {
+    for (const auto& token : query_tokens) {
         ++query_tf[token];
-    }
-
-    const bool semantic_enabled = input.query.size() <= 8192;
-    if (!semantic_enabled && semantic_fallback_used != nullptr) {
-        *semantic_fallback_used = true;
-    }
-
-    std::vector<float> query_embedding;
-    if (semantic_enabled) {
-        query_embedding = Embed(input.query);
     }
 
     const size_t total_docs = snapshot->docs.size();
     const double avgdl =
         total_docs > 0 ? static_cast<double>(snapshot->total_doc_len) / static_cast<double>(total_docs) : 1.0;
 
-    std::vector<SearchHit> hits;
-    hits.reserve(total_docs);
+    const size_t top_k = (input.top_k == 0) ? 8 : input.top_k;
+    const size_t sparse_limit =
+        std::max<size_t>(input.recall.sparse_k, top_k * std::max<size_t>(1, input.recall.oversample));
+    const size_t dense_limit =
+        std::max<size_t>(input.recall.dense_k, top_k * std::max<size_t>(1, input.recall.oversample));
 
+    std::vector<std::pair<std::string, double>> sparse_candidates;
+    sparse_candidates.reserve(total_docs);
+
+    const auto sparse_start = std::chrono::steady_clock::now();
     for (const auto& kv : snapshot->docs) {
         const IndexedDoc& doc = kv.second;
-        SearchHit hit;
+        if (!PassesFilter(doc.record, input.filters)) {
+            continue;
+        }
+        const double sparse_score = LexicalScore(doc, query_tf, total_docs, avgdl, snapshot->df);
+        if (sparse_score <= 0.0) {
+            continue;
+        }
+        sparse_candidates.emplace_back(kv.first, sparse_score);
+    }
+    std::sort(sparse_candidates.begin(), sparse_candidates.end(), [](const auto& lhs, const auto& rhs) {
+        if (lhs.second == rhs.second) {
+            return lhs.first < rhs.first;
+        }
+        return lhs.second > rhs.second;
+    });
+    if (sparse_candidates.size() > sparse_limit) {
+        sparse_candidates.resize(sparse_limit);
+    }
+    const auto sparse_end = std::chrono::steady_clock::now();
+
+    const auto dense_start     = std::chrono::steady_clock::now();
+    const auto query_embedding = embedding_->Embed(input.query, embedding_dim_);
+    VectorSearchRequest dense_req;
+    dense_req.workspace_id = input.workspace_id;
+    dense_req.query        = query_embedding;
+    dense_req.top_k        = dense_limit;
+    auto dense_raw         = vector_index_->Search(dense_req);
+
+    std::vector<VectorSearchResult> dense_candidates;
+    dense_candidates.reserve(dense_raw.size());
+    for (const auto& item : dense_raw) {
+        const auto it = snapshot->docs.find(item.memory_id);
+        if (it == snapshot->docs.end()) {
+            continue;
+        }
+        if (!PassesFilter(it->second.record, input.filters)) {
+            continue;
+        }
+        dense_candidates.push_back(item);
+    }
+    const auto dense_end = std::chrono::steady_clock::now();
+
+    out.debug_stats.sparse_candidates = sparse_candidates.size();
+    out.debug_stats.dense_candidates  = dense_candidates.size();
+
+    std::unordered_map<std::string, ScoreBreakdown> merged;
+    merged.reserve(sparse_candidates.size() + dense_candidates.size());
+    for (const auto& item : sparse_candidates) {
+        merged[item.first].sparse = item.second;
+    }
+    for (const auto& item : dense_candidates) {
+        merged[item.memory_id].dense = item.score;
+    }
+
+    out.debug_stats.merged_candidates = merged.size();
+
+    double sparse_max = 0.0;
+    double dense_max  = 0.0;
+    for (const auto& kv : merged) {
+        sparse_max = std::max(sparse_max, kv.second.sparse);
+        dense_max  = std::max(dense_max, kv.second.dense);
+    }
+
+    const auto rerank_start = std::chrono::steady_clock::now();
+    const uint64_t now_ms   = util::NowMs();
+
+    out.hits.reserve(merged.size());
+    for (auto& kv : merged) {
+        const auto doc_it = snapshot->docs.find(kv.first);
+        if (doc_it == snapshot->docs.end()) {
+            continue;
+        }
+
+        const IndexedDoc& doc = doc_it->second;
+        ScoreBreakdown scores;
+        scores.sparse    = Normalize(kv.second.sparse, sparse_max);
+        scores.dense     = Normalize(kv.second.dense, dense_max);
+        scores.freshness = FreshnessScore(doc.record.updated_at_ms, now_ms);
+        scores.pin       = doc.record.pinned ? 1.0 : 0.0;
+        scores.final     = input.rerank.w_sparse * scores.sparse + input.rerank.w_dense * scores.dense +
+                       input.rerank.w_freshness * scores.freshness + input.rerank.w_pin * scores.pin;
+
+        QueryHit hit;
         hit.memory_id     = doc.record.id;
         hit.source        = doc.record.source;
         hit.content       = doc.record.content;
-        hit.pinned        = doc.record.pinned;
+        hit.tags          = doc.record.tags;
+        hit.metadata      = doc.record.metadata;
+        hit.scores        = scores;
         hit.updated_at_ms = doc.record.updated_at_ms;
-
-        hit.lexical_score = LexicalScore(doc, query_tf, total_docs, avgdl, snapshot->df);
-        if (semantic_enabled) {
-            hit.semantic_score = Cosine(query_embedding, doc.embedding);
-        }
-
-        hit.final_score = 0.65 * hit.lexical_score + 0.35 * hit.semantic_score;
-        if (hit.pinned) {
-            hit.final_score += 0.2;
-        }
-        hits.push_back(std::move(hit));
+        hit.pinned        = doc.record.pinned;
+        out.hits.push_back(std::move(hit));
     }
 
-    std::sort(hits.begin(), hits.end(), [](const SearchHit& lhs, const SearchHit& rhs) {
-        if (lhs.final_score == rhs.final_score) {
+    std::sort(out.hits.begin(), out.hits.end(), [](const QueryHit& lhs, const QueryHit& rhs) {
+        if (lhs.scores.final == rhs.scores.final) {
             return lhs.updated_at_ms > rhs.updated_at_ms;
         }
-        return lhs.final_score > rhs.final_score;
+        return lhs.scores.final > rhs.scores.final;
     });
 
-    if (input.top_k > 0 && hits.size() > input.top_k) {
-        hits.resize(input.top_k);
+    if (out.hits.size() > top_k) {
+        out.hits.resize(top_k);
     }
-    return hits;
+    const auto rerank_end = std::chrono::steady_clock::now();
+
+    out.debug_stats.sparse_ms =
+        std::chrono::duration_cast<std::chrono::microseconds>(sparse_end - sparse_start).count() / 1000.0;
+    out.debug_stats.dense_ms =
+        std::chrono::duration_cast<std::chrono::microseconds>(dense_end - dense_start).count() / 1000.0;
+    out.debug_stats.rerank_ms =
+        std::chrono::duration_cast<std::chrono::microseconds>(rerank_end - rerank_start).count() / 1000.0;
+    out.debug_stats.total_ms =
+        std::chrono::duration_cast<std::chrono::microseconds>(rerank_end - all_start).count() / 1000.0;
+
+    return out;
 }
 
-std::vector<float> HybridRetriever::Embed(const std::string& text) const {
-    std::vector<float> emb(embedding_dim_, 0.0f);
-    const auto tokens = util::Tokenize(text);
-    if (tokens.empty()) {
-        return emb;
-    }
+uint64_t HybridRetriever::EstimatedBytes(const std::string& workspace_id) const {
+    std::shared_lock<std::shared_mutex> lock(mu_);
 
-    for (const std::string& token : tokens) {
-        const size_t index = std::hash<std::string>{}(token) % embedding_dim_;
-        emb[index] += 1.0f;
-    }
-
-    float norm = 0.0f;
-    for (float v : emb) {
-        norm += v * v;
-    }
-    norm = std::sqrt(norm);
-    if (norm > std::numeric_limits<float>::epsilon()) {
-        for (float& v : emb) {
-            v /= norm;
+    uint64_t total = vector_index_->EstimatedBytes(workspace_id);
+    for (const auto& ws_kv : snapshots_) {
+        if (!workspace_id.empty() && ws_kv.first != workspace_id) {
+            continue;
+        }
+        if (!ws_kv.second) {
+            continue;
+        }
+        for (const auto& doc_kv : ws_kv.second->docs) {
+            total += EstimateDocBytes(doc_kv.second.record);
         }
     }
-    return emb;
+    return total;
 }
 
-double HybridRetriever::Cosine(const std::vector<float>& a, const std::vector<float>& b) const {
-    if (a.size() != b.size() || a.empty()) {
-        return 0.0;
+uint64_t HybridRetriever::EstimateDocBytes(const MemoryRecord& record) const {
+    if (record.tombstone) {
+        return 0;
     }
-    double dot = 0.0;
-    for (size_t i = 0; i < a.size(); ++i) {
-        dot += static_cast<double>(a[i]) * static_cast<double>(b[i]);
+
+    const auto tokens = analyzer_->Tokenize(record.content);
+    std::unordered_set<std::string> unique_terms;
+    unique_terms.reserve(tokens.size());
+    for (const auto& token : tokens) {
+        unique_terms.insert(token);
     }
-    return dot;
+
+    uint64_t bytes = EstimateRecordBytes(record);
+    bytes += static_cast<uint64_t>(tokens.size()) * 8ull;
+    bytes += static_cast<uint64_t>(unique_terms.size()) * 48ull;
+    for (const auto& term : unique_terms) {
+        bytes += static_cast<uint64_t>(term.size());
+    }
+    bytes += static_cast<uint64_t>(embedding_dim_) * static_cast<uint64_t>(sizeof(float));
+    bytes += 128;
+    return bytes;
+}
+
+bool HybridRetriever::PassesFilter(const MemoryRecord& record, const QueryFilter& filters) {
+    if (!filters.session_id.empty() && record.session_id != filters.session_id) {
+        return false;
+    }
+    if (!filters.sources.empty() && !ContainsAnySource(record.source, filters.sources)) {
+        return false;
+    }
+    if (!filters.tags_any.empty() && !ContainsAnyTag(record.tags, filters.tags_any)) {
+        return false;
+    }
+    if (filters.updated_after_ms > 0 && record.updated_at_ms < filters.updated_after_ms) {
+        return false;
+    }
+    if (filters.updated_before_ms > 0 && record.updated_at_ms > filters.updated_before_ms) {
+        return false;
+    }
+    if (filters.pinned_only && !record.pinned) {
+        return false;
+    }
+    return !record.tombstone;
+}
+
+bool HybridRetriever::ContainsAnyTag(const std::vector<std::string>& haystack, const std::vector<std::string>& needle) {
+    for (const auto& want : needle) {
+        if (std::find(haystack.begin(), haystack.end(), want) != haystack.end()) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool HybridRetriever::ContainsAnySource(const std::string& source, const std::vector<std::string>& allow) {
+    return std::find(allow.begin(), allow.end(), source) != allow.end();
+}
+
+double HybridRetriever::FreshnessScore(uint64_t updated_at_ms, uint64_t now_ms) {
+    const double age_hours = static_cast<double>(now_ms > updated_at_ms ? (now_ms - updated_at_ms) : 0) / 3600000.0;
+    return 1.0 / (1.0 + age_hours);
 }
 
 double HybridRetriever::LexicalScore(const IndexedDoc& doc, const std::unordered_map<std::string, int>& query_tf,

@@ -2,67 +2,16 @@
 
 #include <sys/wait.h>
 
-#include <boost/property_tree/json_parser.hpp>
-#include <boost/property_tree/ptree.hpp>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
-#include <iostream>
-#include <sstream>
+#include <string>
 
 namespace pgmem::install {
 namespace {
 
 namespace fs = std::filesystem;
-
-bool LooksLikeCommandNotFound(const std::string& output, const std::string& command) {
-    const bool has_cmd       = output.find(command) != std::string::npos;
-    const bool has_not_found = output.find("not found") != std::string::npos ||
-                               output.find("command not found") != std::string::npos ||
-                               output.find("No such file or directory") != std::string::npos;
-    return has_cmd && has_not_found;
-}
-
-bool LooksLikeCodexUnavailable(const std::string& output) {
-    if (LooksLikeCommandNotFound(output, "codex")) {
-        return true;
-    }
-    const bool has_permission_issue = output.find("Permission denied") != std::string::npos ||
-                                      output.find("failed to write MCP servers") != std::string::npos ||
-                                      output.find("failed to persist config.toml") != std::string::npos;
-    return has_permission_issue;
-}
-
-std::string RuleContent() {
-    return R"(---
-description: poorguy-mem memory server contract
-alwaysApply: true
----
-`poorguy-mem` is the workspace memory MCP server.
-
-Execution contract:
-1. If schema is unknown, call `memory.describe` first and follow its contract.
-2. At task/session start, call `memory.bootstrap` with current `workspace_id` and `session_id`.
-3. Before asking for repeated context, call `memory.search` to recall prior facts.
-4. After each meaningful assistant turn, call `memory.commit_turn` with:
-   `workspace_id`, `session_id`, `user_text`, `assistant_text`, plus useful `code_snippets` and `commands`.
-5. If user marks information as important, call `memory.pin`.
-6. For diagnostics only, call `memory.stats` or `memory.compact`.
-
-Protocol constraints:
-- Use only `POST /mcp` with `memory.*` methods.
-- `/sync/push` and `/sync/pull` are removed and must be treated as unavailable.
-)";
-}
-
-fs::path CursorMcpPath(const InstallOptions& options) {
-    return fs::path(options.workspace_root) / ".cursor" / "mcp.json";
-}
-
-fs::path CursorRulePath(const InstallOptions& options) {
-    return fs::path(options.workspace_root) / ".cursor" / "rules" / "poorguy-mem.mdc";
-}
 
 fs::path UserSystemdPath() {
     const char* home = std::getenv("HOME");
@@ -72,215 +21,33 @@ fs::path UserSystemdPath() {
     return fs::path(home) / ".config" / "systemd" / "user" / "pgmemd.service";
 }
 
+std::string ResolveStoreRoot(const std::string& store_root) {
+    fs::path path = store_root.empty() ? fs::path(config::kDefaultStoreRoot) : fs::path(store_root);
+    if (path.is_absolute()) {
+        return path.string();
+    }
+
+    const char* home = std::getenv("HOME");
+    if (home != nullptr) {
+        return (fs::path(home) / path).string();
+    }
+    return path.string();
+}
+
 }  // namespace
 
 bool WorkspaceConfigurator::Install(const InstallOptions& options, std::string* error) const {
-    if (!ConfigureCursorMcp(options, error)) {
-        return false;
+    if (!options.manage_systemd) {
+        return true;
     }
-    if (!ConfigureCursorRule(options, error)) {
-        return false;
-    }
-    if (options.manage_systemd) {
-        if (!WriteSystemdUnit(options, error)) {
-            return false;
-        }
-    }
-    if (options.configure_codex && !ConfigureCodexMcp(options, error)) {
-        return false;
-    }
-    return true;
+    return WriteSystemdUnit(options, error);
 }
 
 bool WorkspaceConfigurator::Uninstall(const InstallOptions& options, std::string* error) const {
-    if (!RemoveCursorMcp(options, error)) {
-        return false;
-    }
-    if (!RemoveCursorRule(options, error)) {
-        return false;
-    }
-    if (options.manage_systemd) {
-        if (!RemoveSystemdUnit(error)) {
-            return false;
-        }
-    }
-    if (options.configure_codex && !RemoveCodexMcp(options, error)) {
-        return false;
-    }
-    return true;
-}
-
-bool WorkspaceConfigurator::ConfigureCursorMcp(const InstallOptions& options, std::string* error) const {
-    const fs::path path = CursorMcpPath(options);
-    fs::create_directories(path.parent_path());
-
-    boost::property_tree::ptree root;
-    if (fs::exists(path)) {
-        try {
-            boost::property_tree::read_json(path.string(), root);
-        } catch (const std::exception& ex) {
-            if (error != nullptr) {
-                *error = std::string("failed to parse ") + path.string() + ": " + ex.what();
-            }
-            return false;
-        }
-    }
-
-    boost::property_tree::ptree servers;
-    if (auto existing = root.get_child_optional("mcpServers")) {
-        servers = *existing;
-    }
-
-    boost::property_tree::ptree server;
-    server.put("url", options.mcp_url);
-    server.put(
-        "description",
-        "Local memory server for this workspace. Use memory.describe/bootstrap/search/commit_turn/pin/stats/compact.");
-    servers.put_child(options.mcp_name, server);
-
-    root.put_child("mcpServers", servers);
-
-    try {
-        boost::property_tree::write_json(path.string(), root);
-    } catch (const std::exception& ex) {
-        if (error != nullptr) {
-            *error = std::string("failed to write ") + path.string() + ": " + ex.what();
-        }
-        return false;
-    }
-
-    return true;
-}
-
-bool WorkspaceConfigurator::RemoveCursorMcp(const InstallOptions& options, std::string* error) const {
-    const fs::path path = CursorMcpPath(options);
-    if (!fs::exists(path)) {
+    if (!options.manage_systemd) {
         return true;
     }
-
-    boost::property_tree::ptree root;
-    try {
-        boost::property_tree::read_json(path.string(), root);
-    } catch (const std::exception& ex) {
-        if (error != nullptr) {
-            *error = std::string("failed to parse ") + path.string() + ": " + ex.what();
-        }
-        return false;
-    }
-
-    auto servers_opt = root.get_child_optional("mcpServers");
-    if (!servers_opt) {
-        return true;
-    }
-
-    servers_opt->erase(options.mcp_name);
-    if (servers_opt->empty()) {
-        root.erase("mcpServers");
-    } else {
-        root.put_child("mcpServers", *servers_opt);
-    }
-
-    try {
-        boost::property_tree::write_json(path.string(), root);
-    } catch (const std::exception& ex) {
-        if (error != nullptr) {
-            *error = std::string("failed to write ") + path.string() + ": " + ex.what();
-        }
-        return false;
-    }
-
-    return true;
-}
-
-bool WorkspaceConfigurator::ConfigureCursorRule(const InstallOptions& options, std::string* error) const {
-    const fs::path path = CursorRulePath(options);
-    fs::create_directories(path.parent_path());
-
-    std::ofstream out(path, std::ios::trunc);
-    if (!out.is_open()) {
-        if (error != nullptr) {
-            *error = std::string("failed to open ") + path.string();
-        }
-        return false;
-    }
-    out << RuleContent();
-    return true;
-}
-
-bool WorkspaceConfigurator::RemoveCursorRule(const InstallOptions& options, std::string* error) const {
-    const fs::path path = CursorRulePath(options);
-    if (!fs::exists(path)) {
-        return true;
-    }
-    std::error_code ec;
-    fs::remove(path, ec);
-    if (ec) {
-        if (error != nullptr) {
-            *error = std::string("failed to remove ") + path.string() + ": " + ec.message();
-        }
-        return false;
-    }
-    return true;
-}
-
-bool WorkspaceConfigurator::ConfigureCodexMcp(const InstallOptions& options, std::string* error) const {
-    std::string output;
-    int code = 0;
-    if (!RunCommand("codex mcp get " + options.mcp_name, &output, &code)) {
-        if (error != nullptr) {
-            *error = "failed to run codex mcp get";
-        }
-        return false;
-    }
-
-    if (code == 0) {
-        return true;
-    }
-
-    if (LooksLikeCodexUnavailable(output)) {
-        std::cerr << "[pgmem-install] warning: codex CLI unavailable, skipping Codex MCP registration\n";
-        return true;
-    }
-
-    const std::string add_cmd = "codex mcp add " + options.mcp_name + " --url " + options.mcp_url;
-    if (!RunCommand(add_cmd, &output, &code)) {
-        if (error != nullptr) {
-            *error = "failed to run codex mcp add";
-        }
-        return false;
-    }
-
-    if (code != 0) {
-        if (LooksLikeCodexUnavailable(output)) {
-            std::cerr << "[pgmem-install] warning: codex CLI unavailable, skipping Codex MCP registration\n";
-            return true;
-        }
-        if (error != nullptr) {
-            *error = "codex mcp add failed: " + output;
-        }
-        return false;
-    }
-
-    return true;
-}
-
-bool WorkspaceConfigurator::RemoveCodexMcp(const InstallOptions& options, std::string* error) const {
-    std::string output;
-    int code = 0;
-    if (!RunCommand("codex mcp remove " + options.mcp_name, &output, &code)) {
-        if (error != nullptr) {
-            *error = "failed to run codex mcp remove";
-        }
-        return false;
-    }
-
-    if (LooksLikeCodexUnavailable(output)) {
-        std::cerr << "[pgmem-install] warning: codex CLI unavailable, skipping Codex MCP removal\n";
-        return true;
-    }
-
-    // If the server is already absent, codex may return non-zero; treat that as acceptable.
-    return true;
+    return RemoveSystemdUnit(error);
 }
 
 bool WorkspaceConfigurator::WriteSystemdUnit(const InstallOptions& options, std::string* error) const {
@@ -302,6 +69,8 @@ bool WorkspaceConfigurator::WriteSystemdUnit(const InstallOptions& options, std:
         return false;
     }
 
+    const std::string store_root = ResolveStoreRoot(options.store_root);
+
     out << "[Unit]\n";
     out << "Description=Poorguy Memory Daemon\n";
     out << "After=network.target\n\n";
@@ -309,14 +78,12 @@ bool WorkspaceConfigurator::WriteSystemdUnit(const InstallOptions& options, std:
     out << "Type=simple\n";
     out << "ExecStart=" << options.pgmemd_bin << " --host " << config::kDefaultHost << " --port "
         << config::kDefaultMcpPort << " --store-backend " << config::kDefaultStoreBackend << " --core-number "
-        << options.core_number << " --enable-io-uring-network-engine "
-        << (options.enable_io_uring_network_engine ? "true" : "false") << " --mem-budget-mb "
-        << config::kDefaultMemBudgetMb << " --disk-budget-gb " << config::kDefaultDiskBudgetGb
-        << " --gc-high-watermark " << config::kDefaultGcHighWatermark << " --gc-low-watermark "
-        << config::kDefaultGcLowWatermark << " --gc-batch-size " << config::kDefaultGcBatchSize
-        << " --max-record-bytes " << config::kDefaultMaxRecordBytes << " --enable-tombstone-gc "
-        << (config::kDefaultEnableTombstoneGc ? "true" : "false") << " --shutdown-drain-timeout-ms "
-        << config::kDefaultShutdownDrainTimeoutMs << " --store-root " << options.workspace_root << "/.pgmem/store";
+        << options.core_number << " --mem-budget-mb " << config::kDefaultMemBudgetMb << " --disk-budget-gb "
+        << config::kDefaultDiskBudgetGb << " --gc-high-watermark " << config::kDefaultGcHighWatermark
+        << " --gc-low-watermark " << config::kDefaultGcLowWatermark << " --gc-batch-size "
+        << config::kDefaultGcBatchSize << " --max-record-bytes " << config::kDefaultMaxRecordBytes
+        << " --enable-tombstone-gc " << (config::kDefaultEnableTombstoneGc ? "true" : "false") << " --store-root "
+        << store_root;
     if (!options.pgmemd_extra_args.empty()) {
         out << " " << options.pgmemd_extra_args;
     }

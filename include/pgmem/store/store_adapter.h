@@ -43,6 +43,16 @@ public:
 
     virtual StoreResult BatchWrite(const std::vector<WriteEntry>& entries) = 0;
     virtual StoreUsage ApproximateUsage(std::string* error)                = 0;
+
+    virtual StoreCompactTriggerResult TriggerStoreCompactAsync() {
+        StoreCompactTriggerResult out;
+        out.triggered = false;
+        out.noop      = true;
+        out.busy      = false;
+        out.async     = true;
+        out.message   = "store compact noop for backend";
+        return out;
+    }
 };
 
 std::unique_ptr<IStoreAdapter> CreateInMemoryStoreAdapter();

@@ -6,7 +6,8 @@
 .mcp.json
 .vscode/
 *.log
+*.gcov
 *.swp
 *.tmp
 .DS_Store
-./compile_commands.json
+compile_commands.json

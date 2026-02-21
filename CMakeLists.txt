@@ -8,6 +8,35 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 option(PGMEM_WITH_ELOQSTORE "Build with EloqStore-backed storage adapter (legacy toggle)" ON)
 option(PGMEM_WITH_ONNX "Build with ONNX Runtime semantic embedder" OFF)
+option(PGMEM_ENABLE_COVERAGE "Enable gcov/lcov coverage instrumentation for pgmem targets" OFF)
+if(DEFINED PGMEM_ELOQ_MODULE_ENABLED)
+    message(FATAL_ERROR "PGMEM_ELOQ_MODULE_ENABLED is removed. Module mode is no longer supported.")
+endif()
+
+set(PGMEM_COVERAGE_FLAGS_ENABLED OFF)
+if(PGMEM_ENABLE_COVERAGE)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        set(PGMEM_COVERAGE_FLAGS_ENABLED ON)
+        message(STATUS "PGMEM coverage instrumentation enabled")
+    else()
+        message(WARNING "PGMEM_ENABLE_COVERAGE is ON but compiler '${CMAKE_CXX_COMPILER_ID}' does not support gcov flags")
+    endif()
+endif()
+
+function(pgmem_enable_coverage target_name)
+    if(PGMEM_COVERAGE_FLAGS_ENABLED)
+        if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+            target_compile_options(${target_name} PRIVATE -O0 -g --coverage -fprofile-update=atomic)
+        else()
+            target_compile_options(${target_name} PRIVATE -O0 -g --coverage)
+        endif()
+        get_target_property(target_type ${target_name} TYPE)
+        if(target_type STREQUAL "EXECUTABLE" OR target_type STREQUAL "SHARED_LIBRARY" OR
+           target_type STREQUAL "MODULE_LIBRARY")
+            target_link_options(${target_name} PRIVATE --coverage)
+        endif()
+    endif()
+endfunction()
 set(PGMEM_STORE_BACKEND "" CACHE STRING "Default storage backend: eloqstore|inmemory")
 set_property(CACHE PGMEM_STORE_BACKEND PROPERTY STRINGS eloqstore inmemory)
 
@@ -82,6 +111,9 @@ set(PGMEM_COMMON_SOURCES
     src/store/in_memory_store_adapter.cpp
     src/store/eloqstore_adapter.cpp
     src/core/metrics.cpp
+    src/core/default_analyzer.cpp
+    src/core/hash_embedding_provider.cpp
+    src/core/lsh_vector_index.cpp
     src/core/retriever.cpp
     src/core/summary.cpp
     src/core/memory_engine.cpp
@@ -112,6 +144,7 @@ target_compile_definitions(pgmem_core
         PGMEM_VERSION=\"${PROJECT_VERSION}\"
         PGMEM_DEFAULT_STORE_BACKEND=\"${PGMEM_EFFECTIVE_BACKEND}\"
 )
+pgmem_enable_coverage(pgmem_core)
 
 if(PGMEM_EFFECTIVE_BACKEND STREQUAL "eloqstore")
     if(EXISTS "${PROJECT_SOURCE_DIR}/third_party/eloqstore/CMakeLists.txt")
@@ -119,8 +152,15 @@ if(PGMEM_EFFECTIVE_BACKEND STREQUAL "eloqstore")
         set(WITH_EXAMPLE OFF CACHE BOOL "" FORCE)
         set(WITH_DB_STRESS OFF CACHE BOOL "" FORCE)
         set(WITH_BENCHMARK OFF CACHE BOOL "" FORCE)
+        set(ELOQ_MODULE_ENABLED OFF CACHE BOOL "" FORCE)
         add_subdirectory(third_party/eloqstore EXCLUDE_FROM_ALL)
         target_compile_definitions(pgmem_core PUBLIC PGMEM_WITH_ELOQSTORE=1)
+        target_include_directories(eloqstore
+            PUBLIC
+                ${PROJECT_SOURCE_DIR}/include/eloqstore_txservice_compat
+        )
+        target_compile_definitions(eloqstore PUBLIC ELOQSTORE_WITH_TXSERVICE=1)
+        target_compile_definitions(pgmem_core PUBLIC ELOQSTORE_WITH_TXSERVICE=1)
         target_link_libraries(pgmem_core PUBLIC eloqstore)
     else()
         message(WARNING "Backend is eloqstore but third_party/eloqstore is missing")
@@ -141,9 +181,11 @@ endif()
 
 add_executable(pgmemd src/apps/pgmemd_main.cpp)
 target_link_libraries(pgmemd PRIVATE pgmem_core)
+pgmem_enable_coverage(pgmemd)
 
 add_executable(pgmem-install src/apps/pgmem_install_main.cpp)
 target_link_libraries(pgmem-install PRIVATE pgmem_core)
+pgmem_enable_coverage(pgmem-install)
 
 include(CTest)
 if(BUILD_TESTING)
@@ -151,12 +193,14 @@ if(BUILD_TESTING)
         tests/unit_main.cpp
         tests/test_text.cpp
         tests/test_memory_engine.cpp
+        tests/test_retriever.cpp
         tests/test_mcp_dispatcher.cpp
         tests/test_brpc_runtime.cpp
         tests/test_store_factory.cpp
         tests/test_workspace_config.cpp
     )
     target_link_libraries(pgmem_unit_tests PRIVATE pgmem_core)
+    pgmem_enable_coverage(pgmem_unit_tests)
     add_test(NAME pgmem_unit_tests COMMAND pgmem_unit_tests)
 endif()
 

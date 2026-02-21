@@ -65,12 +65,13 @@ bool ApplyBrpcRuntimeOptions(const BrpcRuntimeOptions& options, BrpcRuntimeState
 
     bthread::FLAGS_bthread_concurrency = static_cast<int32_t>(resolved_core_number);
     brpc::FLAGS_event_dispatcher_num   = static_cast<int32_t>(resolved_event_dispatcher_num);
-    FLAGS_use_io_uring                 = options.enable_io_uring_network_engine;
+
+    FLAGS_use_io_uring = true;
 
     if (state != nullptr) {
         state->resolved_core_number          = resolved_core_number;
         state->resolved_event_dispatcher_num = resolved_event_dispatcher_num;
-        state->network_io_uring_enabled      = options.enable_io_uring_network_engine;
+        state->network_io_uring_enabled      = true;
     }
     return true;
 }

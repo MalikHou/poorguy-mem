@@ -1,154 +1,110 @@
 # poorguy-mem
 
-Local C++17 MCP memory server for coding assistants.
+Memory MCP is a local-first memory service for AI applications. It provides durable write, hybrid retrieval, and operational controls through a single MCP endpoint.
 
-## Scope
+## Product Positioning
 
-- Backends: `eloqstore`, `inmemory`
-- Write mode: `accepted`
-- Endpoints: `GET /health`, `POST /mcp`, `GET /mcp/describe`
-- Methods:
-  - `memory.describe`
-  - `memory.bootstrap`
-  - `memory.commit_turn`
-  - `memory.search`
-  - `memory.pin`
-  - `memory.stats`
-  - `memory.compact`
+Memory MCP solves one core problem: keep high-value conversation and task memory queryable with stable latency and predictable semantics.
 
-## Quick Start
+It is designed for:
+- agent memory persistence across sessions
+- hybrid recall (keyword + semantic)
+- controllable retention via `pin`, TTL, and compaction
 
-```bash
-scripts/install.sh
-scripts/start.sh
-scripts/deploy_mcp.sh --workspace .
-```
+## Core Capabilities
 
-## Daily Commands
+- `memory.write`: durable memory ingest with indexing
+- `memory.query`: sparse+dense hybrid retrieval with rerank
+- `memory.pin`: retention priority control
+- `memory.stats`: runtime and index observability
+- `memory.compact`: compaction and tombstone cleanup
+- `memory.describe`: versioned machine-readable contract (`describe_version` + `schema_revision`, optional `include_examples`)
 
-```bash
-# dependencies only
-scripts/install_deps.sh
+## Architecture Overview
 
-# dependency probe only
-scripts/install_deps.sh --verify-only
+Request flow:
+1. MCP transport (`POST /mcp`) receives JSON/JSON-RPC request.
+2. Dispatcher validates method and maps payload to typed inputs.
+3. `MemoryEngine` coordinates storage, indexing, and retention logic.
+4. `HybridRetriever` executes sparse recall, dense recall, merge, and rerank.
+5. `StoreAdapter` persists data to `eloqstore` or `inmemory` backend.
 
-# format (uses .clang-format, skips third_party)
-scripts/format.sh --check
-scripts/format.sh --write
+Core modules:
+- MCP layer: `src/mcp/mcp_dispatcher.cpp`
+- Engine layer: `src/core/memory_engine.cpp`
+- Retrieval layer: `src/core/retriever.cpp`
+- Store layer: `src/store/eloqstore_adapter.cpp`, `src/store/in_memory_store_adapter.cpp`
 
-# integrated verification
-scripts/verify.sh all --pgmemd-bin ./build/pgmemd
+## Documentation Index
 
-# cleanup local artifacts
-scripts/clean.sh
-scripts/clean.sh --all
-```
+### Product Docs
 
-Notes:
-- `scripts/install_deps.sh` installs `clang-format-18` by default and requires `clang-format 18.1.3`.
-- `scripts/deploy_mcp.sh` writes:
-  - `.cursor/mcp.json`
-  - `.cursor/rules/poorguy-mem.mdc`
-  - `.mcp.json`
+API:
+- `docs/api/memory-mcp-contract.zh.md`
+- `docs/api/memory-mcp-contract.en.md`
 
-## Parameter Reference
+Architecture and low-level design:
+- `docs/design/memory-mcp-storage-model.zh.md`
+- `docs/design/memory-mcp-storage-model.en.md`
+- `docs/design/memory-mcp-query-pipeline.zh.md`
+- `docs/design/memory-mcp-query-pipeline.en.md`
 
-`scripts/install_deps.sh`
-- `--verify-only`: probe dependencies only; do not install.
+Usage:
+- `docs/usage/memory-mcp-quickstart.zh.md`
+- `docs/usage/memory-mcp-quickstart.en.md`
 
-`scripts/install.sh`
-- `--backend <eloqstore|inmemory>`: build backend preset.
-- `--build-type <type>`: CMake build type (usually `Release`).
-- `--workspace <path>`: target workspace for MCP config files.
-- `--url <mcp-url>`: MCP endpoint used for deployment and checks.
-- `--name <mcp-name>`: MCP server registration name.
-- `--core-number <N>`: runtime core count written into install config.
-- `--auto-install-cli <bool>`: auto-install missing `node/codex/claude`.
-- `--force-login <bool>`: force interactive login for Codex/Claude if needed.
-- `--max-retries <N>`: retry count for install/login/register.
-- `--skip-deps`: skip dependency install stage.
-- `--skip-tests`: skip `ctest` stage.
-- `--skip-deploy`: skip MCP deploy stage.
-- `--allow-codex-miss`: do not fail when Codex MCP registration/check fails.
-- `--allow-claude-miss`: do not fail when Claude MCP registration/check fails.
-- `--allow-runtime-miss`: do not fail when MCP runtime handshake fails.
-- `--allow-mcp-miss`: equivalent to enabling both codex/claude miss flags.
+### Engineering QA
 
-`scripts/start.sh`
-- `--backend <eloqstore|inmemory>`: runtime backend request.
-- `--host <ip>`: bind host.
-- `--port <N>`: bind port.
-- `--store-root <path>`: local data root.
-- `--core-number <N>`: runtime core count.
-- `--enable-io-uring-network-engine <bool>`: brpc network io_uring toggle.
-- `--smoke`: run smoke test and exit.
+- `docs/testing/memory-mcp-testplan.zh.md`
+- `docs/testing/memory-mcp-testplan.en.md`
 
-`scripts/deploy_mcp.sh`
-- `--workspace <path>`: workspace root where Cursor/Claude config is written.
-- `--url <mcp-url>`: MCP server URL.
-- `--name <mcp-name>`: MCP server name in client configs.
-- `--strict-codex <bool>`: fail when Codex registration/check fails.
-- `--strict-claude <bool>`: fail when Claude registration/check fails.
-- `--strict-runtime <bool>`: fail when runtime MCP handshake fails.
-- `--auto-install-cli <bool>`: install missing Codex/Claude CLIs automatically.
-- `--force-login <bool>`: trigger interactive login when session missing.
-- `--max-retries <N>`: retry count for install/register/login flows.
-- `--claude-scope <project|user|local>`: scope passed to `claude mcp add`.
-
-`scripts/format.sh`
-- `--check`: check-only mode; non-zero if formatting is needed.
-- `--write`: in-place format mode (default).
-- `--list-files`: print matched files only.
-- `--clang-format-bin <path>`: clang-format binary path (must be `18.1.3`).
-- `[paths...]`: optional target paths; default is `include src tests proto`.
-
-`scripts/clean.sh`
-- `--runtime-only`: clean runtime artifacts only (default).
-- `--build`: include build artifacts.
-- `--mcp-config`: include local MCP client config files.
-- `--all`: clean runtime + build.
-- `--dry-run`: show deletion targets only.
-
-## Minimal Manual MCP Test
+## Minimal Runnable Example
 
 Start service:
 
 ```bash
+scripts/install.sh
 scripts/start.sh --backend eloqstore
 ```
 
-Write one memory:
+Write:
 
 ```bash
 curl -sS http://127.0.0.1:8765/mcp \
   -X POST \
   -H 'Content-Type: application/json' \
   -d '{
-    "id":"1",
-    "method":"memory.commit_turn",
-    "params":{
-      "workspace_id":"demo",
-      "session_id":"s1",
-      "user_text":"remember: release window is 20:00",
-      "assistant_text":"recorded"
+    "id": 1,
+    "method": "memory.write",
+    "params": {
+      "workspace_id": "demo",
+      "session_id": "s1",
+      "records": [
+        {
+          "source": "turn",
+          "content": "remember retry with exponential backoff",
+          "tags": ["retry", "ops"],
+          "pin": false
+        }
+      ]
     }
   }'
 ```
 
-Search:
+Query:
 
 ```bash
 curl -sS http://127.0.0.1:8765/mcp \
   -X POST \
   -H 'Content-Type: application/json' \
   -d '{
-    "id":"2",
-    "method":"memory.search",
-    "params":{
-      "workspace_id":"demo",
-      "query":"release window",
-      "top_k":3
+    "id": 2,
+    "method": "memory.query",
+    "params": {
+      "workspace_id": "demo",
+      "query": "retry backoff",
+      "top_k": 3,
+      "token_budget": 1200
     }
   }'
 ```
@@ -160,21 +116,8 @@ curl -sS http://127.0.0.1:8765/mcp \
   -X POST \
   -H 'Content-Type: application/json' \
   -d '{
-    "id":"3",
-    "method":"memory.stats",
-    "params":{"workspace_id":"demo","window":"5m"}
+    "id": 3,
+    "method": "memory.stats",
+    "params": {"workspace_id": "demo", "window": "5m"}
   }'
 ```
-
-## Shared Deployment (Multi-user)
-
-One `pgmemd` instance can be shared by multiple users.
-
-- Use one endpoint, e.g. `http://<server-ip>:8765/mcp`
-- Isolate data by stable `workspace_id` per user/team
-- Use `session_id` per conversation/task
-- Put TLS/auth at gateway layer (nginx/caddy/api-gateway)
-
-Current boundary:
-- No built-in auth in `pgmemd`
-- Isolation is logical (`workspace_id`), not OS-level tenant isolation

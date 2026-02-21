@@ -1,4 +1,3 @@
-#include <cstdlib>
 #include <memory>
 #include <vector>
 
@@ -62,13 +61,25 @@ TEST_CASE(test_store_batch_delete_and_usage) {
     ASSERT_TRUE(!get_a.found);
 }
 
-TEST_CASE(test_io_uring_probe_force_unavailable_env) {
-    ASSERT_TRUE(setenv("PGMEM_FORCE_IO_URING_UNAVAILABLE", "1", 1) == 0);
+TEST_CASE(test_store_factory_compact_default_noop_for_inmemory) {
+    pgmem::store::StoreAdapterConfig cfg;
+    cfg.backend = "inmemory";
 
     std::string error;
-    const bool available = pgmem::store::IsIoUringAvailable(&error);
+    auto store = pgmem::store::CreateStoreAdapter(cfg, &error);
+    ASSERT_TRUE(store != nullptr);
+
+    const auto out = store->TriggerStoreCompactAsync();
+    ASSERT_TRUE(!out.triggered);
+    ASSERT_TRUE(out.noop);
+    ASSERT_TRUE(!out.busy);
+    ASSERT_TRUE(out.async);
+    ASSERT_EQ(out.partition_count, 0U);
+}
+
+TEST_CASE(test_io_uring_probe_force_unavailable_flag) {
+    std::string error;
+    const bool available = pgmem::store::IsIoUringAvailable(&error, true);
     ASSERT_TRUE(!available);
     ASSERT_TRUE(error.find("forced unavailable") != std::string::npos);
-
-    ASSERT_TRUE(unsetenv("PGMEM_FORCE_IO_URING_UNAVAILABLE") == 0);
 }

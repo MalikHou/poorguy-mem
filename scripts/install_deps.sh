@@ -2,11 +2,17 @@
 set -euo pipefail
 
 NPROC="$(nproc || echo 4)"
-PYTHON_BIN="${PGMEM_PYTHON_BIN:-python3.11}"
+PYTHON_BIN="python3"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 VERIFY_ONLY=0
 CLANG_FORMAT_PINNED="18.1.3"
+
+if command -v python3.11 >/dev/null 2>&1; then
+  PYTHON_BIN="python3.11"
+elif command -v python3 >/dev/null 2>&1; then
+  PYTHON_BIN="python3"
+fi
 
 usage() {
   cat <<USAGE
@@ -20,8 +26,8 @@ Options:
 Notes:
   This script normally runs:
     third_party/eloqstore/scripts/install_dependency_ubuntu2404.sh
-  and then applies additional compatibility installs/checks required by poorguy-mem.
-  Stable Python defaults to python3.11 (override with PGMEM_PYTHON_BIN).
+  and then applies additional required installs/checks for poorguy-mem.
+  Python selection order: python3.11 first, fallback to python3.
   Installs clang-format-18 by default and requires clang-format ${CLANG_FORMAT_PINNED} exactly.
 USAGE
 }
@@ -56,10 +62,17 @@ ensure_stable_python() {
     python3.11-venv \
     python3.11-distutils
 
-  if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
-    echo "Required stable Python '$PYTHON_BIN' is still unavailable after installation." >&2
-    exit 1
+  if command -v "$PYTHON_BIN" >/dev/null 2>&1; then
+    return
   fi
+
+  if command -v python3.11 >/dev/null 2>&1; then
+    PYTHON_BIN="python3.11"
+    return
+  fi
+
+  echo "Required Python runtime is unavailable after installation (python3.11/python3)." >&2
+  exit 1
 }
 
 awssdk_config_path() {
@@ -383,10 +396,6 @@ EOF2
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --with-eloqstore)
-      echo "Notice: --with-eloqstore is deprecated; EloqStore dependencies are always installed."
-      shift
-      ;;
     --verify-only)
       VERIFY_ONLY=1
       shift
@@ -429,7 +438,7 @@ ensure_clang_format
 echo "Using stable Python: $("$PYTHON_BIN" --version)"
 
 if ! run_eloqstore_official_dependency_script; then
-  echo "Warning: EloqStore official dependency script failed; applying compatibility fallback..." >&2
+  echo "Warning: EloqStore official dependency script failed; applying fallback installs..." >&2
 fi
 
 run_root apt-get install -y \

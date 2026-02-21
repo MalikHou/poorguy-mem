@@ -1,7 +1,5 @@
 #include "pgmem/store/io_uring_probe.h"
 
-#include <cctype>
-#include <cstdlib>
 #include <cstring>
 #include <string>
 
@@ -10,27 +8,11 @@
 #endif
 
 namespace pgmem::store {
-namespace {
 
-bool ParseBoolEnv(const char* value) {
-    if (value == nullptr) {
-        return false;
-    }
-
-    std::string lowered(value);
-    for (char& c : lowered) {
-        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    }
-
-    return lowered == "1" || lowered == "true" || lowered == "yes" || lowered == "on";
-}
-
-}  // namespace
-
-bool IsIoUringAvailable(std::string* error) {
-    if (ParseBoolEnv(std::getenv("PGMEM_FORCE_IO_URING_UNAVAILABLE"))) {
+bool IsIoUringAvailable(std::string* error, bool force_unavailable) {
+    if (force_unavailable) {
         if (error != nullptr) {
-            *error = "forced unavailable by PGMEM_FORCE_IO_URING_UNAVAILABLE";
+            *error = "forced unavailable by test flag";
         }
         return false;
     }

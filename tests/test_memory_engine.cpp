@@ -1,12 +1,9 @@
-#include <atomic>
 #include <chrono>
-#include <functional>
-#include <iomanip>
+#include <map>
 #include <memory>
-#include <mutex>
-#include <sstream>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include "pgmem/core/memory_engine.h"
 #include "pgmem/core/retriever.h"
@@ -16,12 +13,23 @@
 
 namespace {
 
-class ControlledBatchStoreAdapter final : public pgmem::store::IStoreAdapter {
+pgmem::WriteInput BuildSingleWrite(const std::string& workspace, const std::string& content,
+                                   const std::string& dedup_key = "") {
+    pgmem::WriteInput in;
+    in.workspace_id = workspace;
+    in.session_id   = "s1";
+
+    pgmem::WriteRecordInput rec;
+    rec.source    = "turn";
+    rec.content   = content;
+    rec.dedup_key = dedup_key;
+    in.records.push_back(rec);
+    return in;
+}
+
+class HookedStoreAdapter final : public pgmem::store::IStoreAdapter {
 public:
-    ControlledBatchStoreAdapter(int fail_count, bool fail_forever)
-        : inner_(pgmem::store::CreateInMemoryStoreAdapter()),
-          remaining_failures_(fail_count),
-          fail_forever_(fail_forever) {}
+    explicit HookedStoreAdapter(std::shared_ptr<pgmem::store::IStoreAdapter> inner) : inner_(std::move(inner)) {}
 
     pgmem::StoreResult Put(const std::string& name_space, const std::string& key, const std::string& value,
                            uint64_t ts) override {
@@ -38,592 +46,495 @@ public:
 
     std::vector<pgmem::KeyValueEntry> Scan(const std::string& name_space, const std::string& begin,
                                            const std::string& end, size_t limit, std::string* error) override {
+        const auto it = scan_error_once_.find(name_space);
+        if (it != scan_error_once_.end()) {
+            if (error != nullptr) {
+                *error = it->second;
+            }
+            scan_error_once_.erase(it);
+            return {};
+        }
         return inner_->Scan(name_space, begin, end, limit, error);
     }
 
     pgmem::StoreResult BatchWrite(const std::vector<pgmem::WriteEntry>& entries) override {
-        {
-            std::lock_guard<std::mutex> lock(mu_);
-            if (fail_forever_) {
-                return pgmem::StoreResult{false, "injected batch failure"};
-            }
-            if (remaining_failures_ > 0) {
-                --remaining_failures_;
-                return pgmem::StoreResult{false, "injected batch failure"};
-            }
+        if (fail_batch_write_) {
+            return pgmem::StoreResult{false, batch_error_message_};
         }
         return inner_->BatchWrite(entries);
     }
 
-    pgmem::StoreUsage ApproximateUsage(std::string* error) override { return inner_->ApproximateUsage(error); }
+    pgmem::StoreUsage ApproximateUsage(std::string* error) override {
+        if (force_usage_) {
+            if (error != nullptr) {
+                error->clear();
+            }
+            return forced_usage_;
+        }
+        return inner_->ApproximateUsage(error);
+    }
+
+    pgmem::StoreCompactTriggerResult TriggerStoreCompactAsync() override { return inner_->TriggerStoreCompactAsync(); }
+
+    void SetBatchFailure(const std::string& message) {
+        fail_batch_write_    = true;
+        batch_error_message_ = message;
+    }
+
+    void SetScanErrorOnce(const std::string& name_space, const std::string& error) {
+        scan_error_once_[name_space] = error;
+    }
+
+    void SetForcedUsage(const pgmem::StoreUsage& usage) {
+        forced_usage_ = usage;
+        force_usage_  = true;
+    }
 
 private:
-    std::unique_ptr<pgmem::store::IStoreAdapter> inner_;
-    std::mutex mu_;
-    int remaining_failures_{0};
-    bool fail_forever_{false};
+    std::shared_ptr<pgmem::store::IStoreAdapter> inner_;
+    bool fail_batch_write_{false};
+    std::string batch_error_message_{"injected batch failure"};
+    std::map<std::string, std::string> scan_error_once_;
+    bool force_usage_{false};
+    pgmem::StoreUsage forced_usage_{};
 };
 
-bool WaitUntil(const std::function<bool()>& predicate, int timeout_ms, int sleep_step_ms) {
-    const auto start = std::chrono::steady_clock::now();
-    while (true) {
-        if (predicate()) {
+std::shared_ptr<pgmem::store::IStoreAdapter> MakeSharedInMemoryStore() {
+    return std::shared_ptr<pgmem::store::IStoreAdapter>(pgmem::store::CreateInMemoryStoreAdapter().release());
+}
+
+bool HasHitContent(const pgmem::QueryOutput& out, const std::string& needle) {
+    for (const auto& hit : out.hits) {
+        if (hit.content.find(needle) != std::string::npos) {
             return true;
         }
-        const auto elapsed =
-            std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
-        if (elapsed >= timeout_ms) {
-            return false;
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(sleep_step_ms));
     }
-}
-
-std::string ZeroPad20(uint64_t value) {
-    std::ostringstream oss;
-    oss << std::setw(20) << std::setfill('0') << value;
-    return oss.str();
-}
-
-std::string BuildRecordPayload(const std::string& workspace_id, const std::string& memory_id,
-                               const std::string& content, uint64_t updated_at_ms, uint64_t version,
-                               const std::string& node_id) {
-    pgmem::util::Json record;
-    record.put("id", memory_id);
-    record.put("workspace_id", workspace_id);
-    record.put("session_id", "s1");
-    record.put("source", "commit_turn");
-    record.put("content", content);
-    record.put("pinned", false);
-    record.put("tombstone", false);
-    record.put("created_at_ms", updated_at_ms);
-    record.put("updated_at_ms", updated_at_ms);
-    record.put("version", version);
-    record.put("last_access_ms", updated_at_ms);
-    record.put("hit_count", 0);
-    record.put("importance_score", 1.0);
-    record.put("tier", "hot");
-    record.put("node_id", node_id);
-    record.add_child("tags", pgmem::util::MakeArray({"turn"}));
-    return pgmem::util::ToJsonString(record, false);
-}
-
-std::string BuildProjectionEventPayload(const std::string& event_key, const std::string& workspace_id,
-                                        const std::string& memory_id, const std::string& record_payload,
-                                        const std::string& node_id, uint64_t updated_at_ms, uint64_t version) {
-    pgmem::util::Json event;
-    event.put("event_key", event_key);
-    event.put("workspace_id", workspace_id);
-    event.put("memory_id", memory_id);
-    event.put("event_type", "commit_turn");
-    event.put("op_type", "upsert");
-    event.put("updated_at_ms", updated_at_ms);
-    event.put("version", version);
-    event.put("node_id", node_id);
-    event.put("record_payload", record_payload);
-    return pgmem::util::ToJsonString(event, false);
-}
-
-std::string ReadRecordContent(pgmem::store::IStoreAdapter* store, const std::string& workspace_id,
-                              const std::string& memory_id) {
-    const auto out = store->Get("mem_items", workspace_id + ":" + memory_id);
-    if (!out.found) {
-        return {};
-    }
-    pgmem::util::Json json;
-    std::string error;
-    if (!pgmem::util::ParseJson(out.value, &json, &error)) {
-        return {};
-    }
-    return pgmem::util::GetStringOr(json, "content", "");
+    return false;
 }
 
 }  // namespace
 
-TEST_CASE(test_memory_engine_commit_and_search) {
+TEST_CASE(test_memory_engine_write_and_query) {
     auto store     = pgmem::store::CreateInMemoryStoreAdapter();
     auto retriever = pgmem::core::CreateHybridRetriever();
-
     pgmem::core::MemoryEngine engine(std::move(store), std::move(retriever), "node-a");
 
-    pgmem::CommitTurnInput input;
-    input.workspace_id   = "ws";
-    input.session_id     = "sess";
-    input.user_text      = "Please add retry logic";
-    input.assistant_text = "I will add exponential backoff";
-    input.code_snippets  = {"int retry = 3;"};
-    input.commands       = {"make test"};
+    const auto write_out = engine.Write(BuildSingleWrite("ws", "remember retry with exponential backoff"));
+    ASSERT_TRUE(write_out.ok);
+    ASSERT_EQ(write_out.stored_ids.size(), 1U);
 
-    const auto commit_out = engine.CommitTurn(input);
-    ASSERT_EQ(commit_out.stored_ids.size(), 1U);
+    pgmem::QueryInput query;
+    query.workspace_id = "ws";
+    query.query        = "retry backoff";
+    query.top_k        = 3;
 
-    pgmem::SearchInput search;
-    search.workspace_id = "ws";
-    search.query        = "retry backoff";
-    search.top_k        = 3;
-    search.token_budget = 2048;
-
-    const auto search_out = engine.Search(search);
-    ASSERT_TRUE(!search_out.hits.empty());
-    ASSERT_EQ(search_out.hits[0].memory_id, commit_out.stored_ids[0]);
+    const auto query_out = engine.Query(query);
+    ASSERT_TRUE(!query_out.hits.empty());
+    ASSERT_EQ(query_out.hits[0].memory_id, write_out.stored_ids[0]);
 }
 
-TEST_CASE(test_memory_engine_pin) {
+TEST_CASE(test_memory_engine_pin_and_query_filter) {
     auto store     = pgmem::store::CreateInMemoryStoreAdapter();
     auto retriever = pgmem::core::CreateHybridRetriever();
-
     pgmem::core::MemoryEngine engine(std::move(store), std::move(retriever), "node-a");
 
-    pgmem::CommitTurnInput input;
-    input.workspace_id   = "ws";
-    input.session_id     = "sess";
-    input.user_text      = "remember this";
-    input.assistant_text = "done";
-
-    const auto commit_out = engine.CommitTurn(input);
-    ASSERT_EQ(commit_out.stored_ids.size(), 1U);
+    auto write     = BuildSingleWrite("ws", "critical runbook entry");
+    const auto out = engine.Write(write);
+    ASSERT_EQ(out.stored_ids.size(), 1U);
 
     std::string error;
-    ASSERT_TRUE(engine.Pin("ws", commit_out.stored_ids[0], true, &error));
+    ASSERT_TRUE(engine.Pin("ws", out.stored_ids[0], true, &error));
+
+    pgmem::QueryInput query;
+    query.workspace_id        = "ws";
+    query.query               = "runbook";
+    query.filters.pinned_only = true;
+
+    const auto query_out = engine.Query(query);
+    ASSERT_TRUE(!query_out.hits.empty());
+    ASSERT_TRUE(query_out.hits[0].pinned);
 }
 
-TEST_CASE(test_memory_engine_compact_tombstone_and_stats) {
+TEST_CASE(test_memory_engine_workspace_isolation) {
     auto store     = pgmem::store::CreateInMemoryStoreAdapter();
     auto retriever = pgmem::core::CreateHybridRetriever();
-
-    pgmem::core::MemoryEngineOptions options;
-    options.enable_tombstone_gc = false;
-    options.gc_batch_size       = 32;
-
-    pgmem::core::MemoryEngine engine(std::move(store), std::move(retriever), "node-a", options);
-
-    std::string long_text(1600, 'x');
-
-    pgmem::CommitTurnInput input;
-    input.workspace_id    = "ws";
-    input.session_id      = "sess";
-    input.user_text       = "keep memory growth under control";
-    input.assistant_text  = long_text;
-    const auto commit_out = engine.CommitTurn(input);
-    ASSERT_EQ(commit_out.stored_ids.size(), 1U);
-
-    const auto compact_out = engine.Compact("ws");
-    ASSERT_TRUE(compact_out.triggered);
-    ASSERT_TRUE(compact_out.summarized_count > 0 || compact_out.tombstoned_count > 0);
-
-    const auto stats = engine.Stats("ws", "5m");
-    ASSERT_TRUE(stats.item_count > 0);
-    ASSERT_TRUE(stats.tombstone_count > 0);
-}
-
-TEST_CASE(test_memory_engine_writes_projection_events_and_checkpoint) {
-    auto store      = pgmem::store::CreateInMemoryStoreAdapter();
-    auto* store_ptr = store.get();
-    auto retriever  = pgmem::core::CreateHybridRetriever();
-
     pgmem::core::MemoryEngine engine(std::move(store), std::move(retriever), "node-a");
 
-    pgmem::CommitTurnInput input;
-    input.workspace_id   = "ws-proj";
-    input.session_id     = "sess";
-    input.user_text      = "remember retry settings";
-    input.assistant_text = "retry with exponential backoff";
+    ASSERT_EQ(engine.Write(BuildSingleWrite("ws-main", "token_main_workspace_only")).stored_ids.size(), 1U);
+    ASSERT_EQ(engine.Write(BuildSingleWrite("ws-other", "token_other_workspace_only")).stored_ids.size(), 1U);
 
-    const auto out = engine.CommitTurn(input);
-    ASSERT_EQ(out.stored_ids.size(), 1U);
+    pgmem::QueryInput cross;
+    cross.workspace_id = "ws-main";
+    cross.query        = "token_other_workspace_only";
+    const auto out     = engine.Query(cross);
 
-    std::string scan_error;
-    std::vector<pgmem::KeyValueEntry> events;
-    const bool events_persisted = WaitUntil(
-        [&]() {
-            scan_error.clear();
-            events = store_ptr->Scan("ds_events", "ws-proj:", "ws-proj;", 0, &scan_error);
-            return scan_error.empty() && !events.empty();
-        },
-        1000, 10);
-    ASSERT_TRUE(events_persisted);
-    ASSERT_TRUE(scan_error.empty());
-    ASSERT_TRUE(!events.empty());
-
-    pgmem::util::Json event_json;
-    std::string parse_error;
-    ASSERT_TRUE(pgmem::util::ParseJson(events.back().value, &event_json, &parse_error));
-    ASSERT_EQ(pgmem::util::GetStringOr(event_json, "workspace_id", ""), "ws-proj");
-    ASSERT_TRUE(!pgmem::util::GetStringOr(event_json, "record_payload", "").empty());
-
-    const bool checkpoint_persisted =
-        WaitUntil([&]() { return store_ptr->Get("ds_projection_ckpt", "ws-proj").found; }, 1000, 10);
-    ASSERT_TRUE(checkpoint_persisted);
-}
-
-TEST_CASE(test_memory_engine_compact_all_workspaces_runs_workspace_scoped_batches) {
-    auto store     = pgmem::store::CreateInMemoryStoreAdapter();
-    auto retriever = pgmem::core::CreateHybridRetriever();
-
-    pgmem::core::MemoryEngineOptions options;
-    options.enable_tombstone_gc = false;
-    options.gc_batch_size       = 64;
-
-    pgmem::core::MemoryEngine engine(std::move(store), std::move(retriever), "node-a", options);
-
-    std::string long_text(1800, 'x');
-
-    pgmem::CommitTurnInput ws1;
-    ws1.workspace_id   = "ws1";
-    ws1.session_id     = "sess";
-    ws1.user_text      = "first workspace";
-    ws1.assistant_text = long_text;
-    ASSERT_EQ(engine.CommitTurn(ws1).stored_ids.size(), 1U);
-
-    pgmem::CommitTurnInput ws2;
-    ws2.workspace_id   = "ws2";
-    ws2.session_id     = "sess";
-    ws2.user_text      = "second workspace";
-    ws2.assistant_text = long_text;
-    ASSERT_EQ(engine.CommitTurn(ws2).stored_ids.size(), 1U);
-
-    const auto compact_out = engine.Compact("");
-    ASSERT_TRUE(compact_out.triggered);
-
-    const auto stats_ws1 = engine.Stats("ws1", "5m");
-    const auto stats_ws2 = engine.Stats("ws2", "5m");
-    ASSERT_TRUE(stats_ws1.item_count > 0);
-    ASSERT_TRUE(stats_ws2.item_count > 0);
-}
-
-TEST_CASE(test_memory_engine_warmup_replay_lww_conflict_resolution) {
-    auto store      = pgmem::store::CreateInMemoryStoreAdapter();
-    auto* store_ptr = store.get();
-
-    const std::string workspace_id = "ws-replay";
-    const std::string memory_id    = "m1";
-
-    const std::string old_payload = BuildRecordPayload(workspace_id, memory_id, "old_payload_only", 1000, 1, "node-a");
-    ASSERT_TRUE(store_ptr->Put("mem_items", workspace_id + ":" + memory_id, old_payload, 1000).ok);
-
-    const std::string newer_payload =
-        BuildRecordPayload(workspace_id, memory_id, "new_payload_applied", 2000, 2, "node-b");
-    const std::string stale_late_payload =
-        BuildRecordPayload(workspace_id, memory_id, "stale_payload_ignored", 1500, 1, "node-z");
-
-    const std::string newer_event_key = workspace_id + ":" + ZeroPad20(2000) + ":" + ZeroPad20(1) + ":" + memory_id;
-    const std::string stale_late_event_key =
-        workspace_id + ":" + ZeroPad20(3000) + ":" + ZeroPad20(2) + ":" + memory_id;
-
-    ASSERT_TRUE(store_ptr
-                    ->Put("ds_events", newer_event_key,
-                          BuildProjectionEventPayload(newer_event_key, workspace_id, memory_id, newer_payload, "node-b",
-                                                      2000, 2),
-                          2000)
-                    .ok);
-    ASSERT_TRUE(store_ptr
-                    ->Put("ds_events", stale_late_event_key,
-                          BuildProjectionEventPayload(stale_late_event_key, workspace_id, memory_id, stale_late_payload,
-                                                      "node-z", 1500, 1),
-                          3000)
-                    .ok);
-
-    auto retriever = pgmem::core::CreateHybridRetriever();
-    pgmem::core::MemoryEngine engine(std::move(store), std::move(retriever), "node-a");
-    std::string error;
-    ASSERT_TRUE(engine.Warmup(&error));
-
-    pgmem::SearchInput search;
-    search.workspace_id = workspace_id;
-    search.query        = "new_payload_applied";
-    search.top_k        = 1;
-    search.token_budget = 1024;
-    const auto out      = engine.Search(search);
-    ASSERT_TRUE(!out.hits.empty());
-    ASSERT_EQ(out.hits[0].memory_id, memory_id);
-    ASSERT_TRUE(out.hits[0].content.find("new_payload_applied") != std::string::npos);
-
-    const std::string persisted_content = ReadRecordContent(store_ptr, workspace_id, memory_id);
-    ASSERT_TRUE(persisted_content.find("new_payload_applied") != std::string::npos);
-    ASSERT_TRUE(persisted_content.find("stale_payload_ignored") == std::string::npos);
-}
-
-TEST_CASE(test_memory_engine_warmup_replay_checkpoint_skips_old_events) {
-    auto store      = pgmem::store::CreateInMemoryStoreAdapter();
-    auto* store_ptr = store.get();
-
-    const std::string workspace_id = "ws-ckpt";
-    const std::string memory_id    = "m2";
-
-    const std::string skipped_payload =
-        BuildRecordPayload(workspace_id, memory_id, "event_before_checkpoint_should_skip", 1000, 1, "node-a");
-    const std::string applied_payload =
-        BuildRecordPayload(workspace_id, memory_id, "event_after_checkpoint_should_apply", 2000, 2, "node-b");
-
-    const std::string skipped_event_key = workspace_id + ":" + ZeroPad20(1000) + ":" + ZeroPad20(1) + ":" + memory_id;
-    const std::string applied_event_key = workspace_id + ":" + ZeroPad20(2000) + ":" + ZeroPad20(2) + ":" + memory_id;
-
-    ASSERT_TRUE(store_ptr
-                    ->Put("ds_events", skipped_event_key,
-                          BuildProjectionEventPayload(skipped_event_key, workspace_id, memory_id, skipped_payload,
-                                                      "node-a", 1000, 1),
-                          1000)
-                    .ok);
-    ASSERT_TRUE(store_ptr
-                    ->Put("ds_events", applied_event_key,
-                          BuildProjectionEventPayload(applied_event_key, workspace_id, memory_id, applied_payload,
-                                                      "node-b", 2000, 2),
-                          2000)
-                    .ok);
-
-    pgmem::util::Json ckpt;
-    ckpt.put("workspace_id", workspace_id);
-    ckpt.put("event_key", skipped_event_key);
-    ckpt.put("updated_at_ms", 1000);
-    ASSERT_TRUE(store_ptr->Put("ds_projection_ckpt", workspace_id, pgmem::util::ToJsonString(ckpt, false), 1000).ok);
-
-    auto retriever = pgmem::core::CreateHybridRetriever();
-    pgmem::core::MemoryEngine engine(std::move(store), std::move(retriever), "node-a");
-    std::string error;
-    ASSERT_TRUE(engine.Warmup(&error));
-
-    const std::string persisted_content = ReadRecordContent(store_ptr, workspace_id, memory_id);
-    ASSERT_TRUE(persisted_content.find("event_after_checkpoint_should_apply") != std::string::npos);
-    ASSERT_TRUE(persisted_content.find("event_before_checkpoint_should_skip") == std::string::npos);
-
-    const auto latest_ckpt = store_ptr->Get("ds_projection_ckpt", workspace_id);
-    ASSERT_TRUE(latest_ckpt.found);
-    pgmem::util::Json latest_ckpt_json;
-    std::string parse_error;
-    ASSERT_TRUE(pgmem::util::ParseJson(latest_ckpt.value, &latest_ckpt_json, &parse_error));
-    ASSERT_EQ(pgmem::util::GetStringOr(latest_ckpt_json, "event_key", ""), applied_event_key);
-}
-
-TEST_CASE(test_memory_engine_accepted_mode_reports_queue_stats) {
-    auto store     = pgmem::store::CreateInMemoryStoreAdapter();
-    auto retriever = pgmem::core::CreateHybridRetriever();
-
-    pgmem::core::MemoryEngineOptions options;
-    options.write_ack_mode             = pgmem::core::WriteAckMode::Accepted;
-    options.volatile_flush_interval_ms = 10;
-    options.volatile_max_pending_ops   = 64;
-    options.shutdown_drain_timeout_ms  = 1000;
-    options.effective_backend          = "inmemory";
-
-    pgmem::core::MemoryEngine engine(std::move(store), std::move(retriever), "node-a", options);
-
-    pgmem::CommitTurnInput input;
-    input.workspace_id   = "ws";
-    input.session_id     = "sess";
-    input.user_text      = "accepted mode memory";
-    input.assistant_text = "queued then flushed";
-    const auto out       = engine.CommitTurn(input);
-    ASSERT_EQ(out.stored_ids.size(), 1U);
-
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
-    const auto stats = engine.Stats("ws", "5m");
-    ASSERT_EQ(stats.write_ack_mode, "accepted");
-    ASSERT_EQ(stats.effective_backend, "inmemory");
-    ASSERT_TRUE(stats.pending_write_ops <= 64);
-}
-
-TEST_CASE(test_memory_engine_accepted_mode_retries_flush_failures) {
-    auto store     = std::make_unique<ControlledBatchStoreAdapter>(2, false);
-    auto retriever = pgmem::core::CreateHybridRetriever();
-
-    pgmem::core::MemoryEngineOptions options;
-    options.write_ack_mode             = pgmem::core::WriteAckMode::Accepted;
-    options.volatile_flush_interval_ms = 5;
-    options.volatile_max_pending_ops   = 512;
-    options.shutdown_drain_timeout_ms  = 1000;
-    options.effective_backend          = "inmemory";
-
-    pgmem::core::MemoryEngine engine(std::move(store), std::move(retriever), "node-a", options);
-
-    pgmem::CommitTurnInput input;
-    input.workspace_id   = "ws-retry";
-    input.session_id     = "sess";
-    input.user_text      = "retry flush";
-    input.assistant_text = "background retry";
-    const auto out       = engine.CommitTurn(input);
-    ASSERT_EQ(out.stored_ids.size(), 1U);
-
-    const bool drained = WaitUntil([&]() { return engine.Stats("ws-retry", "5m").pending_write_ops == 0; }, 3000, 20);
-    ASSERT_TRUE(drained);
-
-    const auto stats = engine.Stats("ws-retry", "5m");
-    ASSERT_EQ(stats.write_ack_mode, "accepted");
-    ASSERT_TRUE(stats.flush_failures_total >= 2);
-    ASSERT_TRUE(stats.last_flush_error.empty());
-
-    pgmem::SearchInput search;
-    search.workspace_id   = "ws-retry";
-    search.query          = "retry flush";
-    search.top_k          = 1;
-    search.token_budget   = 1024;
-    const auto search_out = engine.Search(search);
-    ASSERT_TRUE(!search_out.hits.empty());
-}
-
-TEST_CASE(test_memory_engine_accepted_mode_queue_full_falls_back_to_sync_write) {
-    auto store     = pgmem::store::CreateInMemoryStoreAdapter();
-    auto retriever = pgmem::core::CreateHybridRetriever();
-
-    pgmem::core::MemoryEngineOptions options;
-    options.write_ack_mode             = pgmem::core::WriteAckMode::Accepted;
-    options.volatile_flush_interval_ms = 1000;
-    options.volatile_max_pending_ops   = 1;
-    options.shutdown_drain_timeout_ms  = 1000;
-    options.effective_backend          = "inmemory";
-
-    pgmem::core::MemoryEngine engine(std::move(store), std::move(retriever), "node-a", options);
-
-    pgmem::CommitTurnInput input;
-    input.workspace_id   = "ws-fallback";
-    input.session_id     = "sess";
-    input.user_text      = "queue full fallback";
-    input.assistant_text = "sync write fallback should persist";
-    const auto out       = engine.CommitTurn(input);
-    ASSERT_EQ(out.stored_ids.size(), 1U);
-
-    const auto stats = engine.Stats("ws-fallback", "5m");
-    ASSERT_EQ(stats.write_ack_mode, "accepted");
-    ASSERT_EQ(stats.pending_write_ops, 0U);
-    ASSERT_EQ(stats.flush_failures_total, 0U);
-
-    pgmem::SearchInput search;
-    search.workspace_id   = "ws-fallback";
-    search.query          = "queue full fallback";
-    search.top_k          = 1;
-    search.token_budget   = 1024;
-    const auto search_out = engine.Search(search);
-    ASSERT_TRUE(!search_out.hits.empty());
-}
-
-TEST_CASE(test_memory_engine_accepted_mode_shutdown_drain_timeout_does_not_hang) {
-    auto store     = std::make_unique<ControlledBatchStoreAdapter>(0, true);
-    auto retriever = pgmem::core::CreateHybridRetriever();
-
-    pgmem::core::MemoryEngineOptions options;
-    options.write_ack_mode             = pgmem::core::WriteAckMode::Accepted;
-    options.volatile_flush_interval_ms = 5;
-    options.volatile_max_pending_ops   = 512;
-    options.shutdown_drain_timeout_ms  = 50;
-    options.effective_backend          = "inmemory";
-
-    const auto start = std::chrono::steady_clock::now();
-    {
-        pgmem::core::MemoryEngine engine(std::move(store), std::move(retriever), "node-a", options);
-
-        pgmem::CommitTurnInput input;
-        input.workspace_id   = "ws-shutdown";
-        input.session_id     = "sess";
-        input.user_text      = "shutdown timeout";
-        input.assistant_text = "flush always failing";
-        const auto out       = engine.CommitTurn(input);
-        ASSERT_EQ(out.stored_ids.size(), 1U);
-
-        std::this_thread::sleep_for(std::chrono::milliseconds(30));
-        const auto stats = engine.Stats("ws-shutdown", "5m");
-        ASSERT_TRUE(stats.pending_write_ops > 0);
+    bool leaked = false;
+    for (const auto& hit : out.hits) {
+        if (hit.content.find("token_other_workspace_only") != std::string::npos) {
+            leaked = true;
+            break;
+        }
     }
-    const auto elapsed_ms =
-        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
-    ASSERT_TRUE(elapsed_ms < 1500);
+    ASSERT_TRUE(!leaked);
 }
 
-TEST_CASE(test_memory_engine_accepted_mode_shutdown_reports_dropped_count) {
-    auto store     = std::make_unique<ControlledBatchStoreAdapter>(0, true);
+TEST_CASE(test_memory_engine_dedup_key) {
+    auto store     = pgmem::store::CreateInMemoryStoreAdapter();
     auto retriever = pgmem::core::CreateHybridRetriever();
+    pgmem::core::MemoryEngine engine(std::move(store), std::move(retriever), "node-a");
 
-    pgmem::core::MemoryEngineOptions options;
-    options.write_ack_mode             = pgmem::core::WriteAckMode::Accepted;
-    options.volatile_flush_interval_ms = 5;
-    options.volatile_max_pending_ops   = 512;
-    options.shutdown_drain_timeout_ms  = 20;
-    options.effective_backend          = "inmemory";
+    const auto first = engine.Write(BuildSingleWrite("ws", "first payload", "incident-1"));
+    ASSERT_EQ(first.stored_ids.size(), 1U);
 
-    pgmem::core::MemoryEngine engine(std::move(store), std::move(retriever), "node-a", options);
-
-    pgmem::CommitTurnInput input;
-    input.workspace_id   = "ws-drop";
-    input.session_id     = "sess";
-    input.user_text      = "drop test";
-    input.assistant_text = "flush always failing";
-    const auto out       = engine.CommitTurn(input);
-    ASSERT_EQ(out.stored_ids.size(), 1U);
-
-    const bool queued = WaitUntil([&]() { return engine.Stats("ws-drop", "5m").pending_write_ops > 0; }, 1000, 10);
-    ASSERT_TRUE(queued);
-
-    const auto start = std::chrono::steady_clock::now();
-    engine.Shutdown();
-    const auto elapsed_ms =
-        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
-    ASSERT_TRUE(elapsed_ms < 1500);
-
-    const auto stats = engine.Stats("ws-drop", "5m");
-    ASSERT_EQ(stats.pending_write_ops, 0U);
-    ASSERT_TRUE(stats.volatile_dropped_on_shutdown > 0);
+    const auto second = engine.Write(BuildSingleWrite("ws", "second payload", "incident-1"));
+    ASSERT_TRUE(second.ok);
+    ASSERT_TRUE(second.stored_ids.empty());
+    ASSERT_EQ(second.deduped_ids.size(), 1U);
+    ASSERT_EQ(second.deduped_ids[0], first.stored_ids[0]);
 }
 
-TEST_CASE(test_memory_engine_compact_with_tombstone_gc_physically_deletes_records) {
-    auto store      = pgmem::store::CreateInMemoryStoreAdapter();
-    auto* store_ptr = store.get();
-    auto retriever  = pgmem::core::CreateHybridRetriever();
+TEST_CASE(test_memory_engine_dedup_append_mode_keeps_new_write) {
+    auto store     = pgmem::store::CreateInMemoryStoreAdapter();
+    auto retriever = pgmem::core::CreateHybridRetriever();
+    pgmem::core::MemoryEngine engine(std::move(store), std::move(retriever), "node-a");
+
+    const auto first = engine.Write(BuildSingleWrite("ws", "first append payload", "append-key-1"));
+    ASSERT_EQ(first.stored_ids.size(), 1U);
+
+    auto second_in       = BuildSingleWrite("ws", "second append payload", "append-key-1");
+    second_in.write_mode = "append";
+    const auto second    = engine.Write(second_in);
+    ASSERT_TRUE(second.ok);
+    ASSERT_EQ(second.stored_ids.size(), 1U);
+    ASSERT_TRUE(second.deduped_ids.empty());
+}
+
+TEST_CASE(test_memory_engine_compact_and_stats) {
+    auto store     = pgmem::store::CreateInMemoryStoreAdapter();
+    auto retriever = pgmem::core::CreateHybridRetriever();
 
     pgmem::core::MemoryEngineOptions options;
     options.enable_tombstone_gc    = true;
     options.tombstone_retention_ms = 0;
     options.gc_batch_size          = 64;
+    options.effective_backend      = "inmemory";
 
     pgmem::core::MemoryEngine engine(std::move(store), std::move(retriever), "node-a", options);
 
-    std::string long_text(1800, 'x');
-    pgmem::CommitTurnInput input;
-    input.workspace_id    = "ws-gc";
-    input.session_id      = "sess";
-    input.user_text       = "force tombstone";
-    input.assistant_text  = long_text;
-    const auto commit_out = engine.CommitTurn(input);
-    ASSERT_EQ(commit_out.stored_ids.size(), 1U);
-    const std::string original_id = commit_out.stored_ids[0];
+    ASSERT_EQ(engine.Write(BuildSingleWrite("ws", std::string(2048, 'x'))).stored_ids.size(), 1U);
+    ASSERT_EQ(engine.Write(BuildSingleWrite("ws", std::string(2048, 'y'))).stored_ids.size(), 1U);
 
-    const auto first_compact = engine.Compact("ws-gc");
-    ASSERT_TRUE(first_compact.triggered);
-    ASSERT_TRUE(first_compact.tombstoned_count > 0);
+    const auto compact = engine.Compact("ws");
+    ASSERT_TRUE(compact.triggered);
 
-    const auto second_compact = engine.Compact("ws-gc");
-    ASSERT_TRUE(second_compact.triggered);
-    ASSERT_TRUE(second_compact.deleted_count > 0);
-
-    const auto original_record = store_ptr->Get("mem_items", "ws-gc:" + original_id);
-    ASSERT_TRUE(!original_record.found);
+    const auto stats = engine.Stats("ws", "5m");
+    ASSERT_EQ(stats.write_ack_mode, "durable");
+    ASSERT_EQ(stats.effective_backend, "inmemory");
+    ASSERT_TRUE(stats.item_count >= 2);
+    ASSERT_TRUE(stats.tombstone_count >= 1);
 }
 
-TEST_CASE(test_memory_engine_bootstrap_respects_token_budget) {
+TEST_CASE(test_memory_engine_compact_two_phase_reclaims_storage) {
     auto store     = pgmem::store::CreateInMemoryStoreAdapter();
     auto retriever = pgmem::core::CreateHybridRetriever();
 
+    pgmem::core::MemoryEngineOptions options;
+    options.enable_tombstone_gc    = true;
+    options.tombstone_retention_ms = 0;
+    options.gc_batch_size          = 64;
+    options.max_pinned_ratio       = 0.5;
+
+    pgmem::core::MemoryEngine engine(std::move(store), std::move(retriever), "node-a", options);
+
+    auto unpinned = BuildSingleWrite("ws", "compact_delete_token");
+    ASSERT_EQ(engine.Write(unpinned).stored_ids.size(), 1U);
+
+    pgmem::WriteInput pinned_in;
+    pinned_in.workspace_id = "ws";
+    pinned_in.session_id   = "s1";
+    pgmem::WriteRecordInput rec;
+    rec.source  = "turn";
+    rec.content = "pinned_survivor_token";
+    rec.pin     = true;
+    pinned_in.records.push_back(rec);
+    ASSERT_EQ(engine.Write(pinned_in).stored_ids.size(), 1U);
+
+    const auto first = engine.Compact("ws");
+    ASSERT_TRUE(first.triggered);
+    ASSERT_TRUE(first.tombstoned_count >= 1);
+
+    const auto second = engine.Compact("ws");
+    ASSERT_TRUE(second.triggered);
+    ASSERT_TRUE(second.deleted_count >= 1);
+    ASSERT_TRUE(second.postings_reclaimed >= 1);
+    ASSERT_TRUE(second.vectors_reclaimed >= 1);
+    ASSERT_TRUE(second.capacity_blocked);
+}
+
+TEST_CASE(test_memory_engine_resident_limit_evicts_entries) {
+    auto store     = pgmem::store::CreateInMemoryStoreAdapter();
+    auto retriever = pgmem::core::CreateHybridRetriever();
+
+    pgmem::core::MemoryEngineOptions options;
+    options.mem_budget_mb    = 1;
+    options.max_record_bytes = 262144;
+
+    pgmem::core::MemoryEngine engine(std::move(store), std::move(retriever), "node-a", options);
+
+    for (int i = 0; i < 10; ++i) {
+        auto in = BuildSingleWrite("ws", "resident_limit_token_" + std::to_string(i) + " " + std::string(120000, 'x'));
+        in.records[0].record_id = "mem-" + std::to_string(i);
+        const auto out          = engine.Write(in);
+        ASSERT_TRUE(out.ok);
+        ASSERT_EQ(out.stored_ids.size(), 1U);
+    }
+
+    const auto stats = engine.Stats("ws", "5m");
+    ASSERT_TRUE(stats.resident_evicted_count > 0);
+    ASSERT_TRUE(stats.resident_used_bytes <= stats.resident_limit_bytes);
+    ASSERT_TRUE(stats.item_count < 10);
+}
+
+TEST_CASE(test_memory_engine_write_validation_and_persist_batch_failure) {
+    auto shared_store = MakeSharedInMemoryStore();
+    auto store        = std::make_unique<HookedStoreAdapter>(shared_store);
+    store->SetBatchFailure("batch write failed for test");
+    auto retriever = pgmem::core::CreateHybridRetriever();
+
+    pgmem::core::MemoryEngineOptions options;
+    options.max_record_bytes = 2048;
+    pgmem::core::MemoryEngine engine(std::move(store), std::move(retriever), "node-a", options);
+
+    pgmem::WriteInput missing_workspace = BuildSingleWrite("", "missing workspace");
+    const auto missing_workspace_out    = engine.Write(missing_workspace);
+    ASSERT_TRUE(!missing_workspace_out.ok);
+    ASSERT_TRUE(!missing_workspace_out.warnings.empty());
+
+    pgmem::WriteInput empty_records;
+    empty_records.workspace_id   = "ws";
+    const auto empty_records_out = engine.Write(empty_records);
+    ASSERT_TRUE(empty_records_out.ok);
+    ASSERT_TRUE(!empty_records_out.warnings.empty());
+
+    const auto oversized_out = engine.Write(BuildSingleWrite("ws", std::string(4096, 'z')));
+    ASSERT_TRUE(oversized_out.ok);
+    ASSERT_TRUE(oversized_out.stored_ids.empty());
+    ASSERT_TRUE(!oversized_out.warnings.empty());
+
+    auto failing                 = BuildSingleWrite("ws", "normal sized");
+    failing.records[0].record_id = "batch-fail";
+    const auto failing_out       = engine.Write(failing);
+    ASSERT_TRUE(!failing_out.ok);
+    ASSERT_TRUE(!failing_out.warnings.empty());
+}
+
+TEST_CASE(test_memory_engine_pin_governance_and_not_found) {
+    auto store     = pgmem::store::CreateInMemoryStoreAdapter();
+    auto retriever = pgmem::core::CreateHybridRetriever();
+
+    pgmem::core::MemoryEngineOptions options;
+    options.pin_quota_per_workspace = 0;
+    options.max_pinned_ratio        = 0.0;
+
+    pgmem::core::MemoryEngine engine(std::move(store), std::move(retriever), "node-a", options);
+
+    pgmem::WriteInput in;
+    in.workspace_id = "ws";
+    in.session_id   = "s1";
+    pgmem::WriteRecordInput rec;
+    rec.source  = "turn";
+    rec.content = "pin_governance_token";
+    rec.pin     = true;
+    in.records.push_back(rec);
+    const auto write_out = engine.Write(in);
+    ASSERT_TRUE(write_out.ok);
+    ASSERT_EQ(write_out.stored_ids.size(), 1U);
+    ASSERT_TRUE(!write_out.warnings.empty());
+
+    pgmem::QueryInput pinned_only;
+    pinned_only.workspace_id        = "ws";
+    pinned_only.query               = "pin_governance_token";
+    pinned_only.filters.pinned_only = true;
+    const auto pinned_query         = engine.Query(pinned_only);
+    ASSERT_TRUE(pinned_query.hits.empty());
+
+    std::string error;
+    ASSERT_TRUE(!engine.Pin("ws", write_out.stored_ids[0], true, &error));
+    ASSERT_TRUE(error.find("pin quota exceeded") != std::string::npos);
+
+    ASSERT_TRUE(!engine.Pin("ws", "missing-id", true, &error));
+    ASSERT_TRUE(error.find("record not found") != std::string::npos);
+}
+
+TEST_CASE(test_memory_engine_warmup_replay_and_load_from_store_paths) {
+    auto shared_store = MakeSharedInMemoryStore();
+
+    {
+        auto store     = std::make_unique<HookedStoreAdapter>(shared_store);
+        auto retriever = pgmem::core::CreateHybridRetriever();
+        pgmem::core::MemoryEngine engine(std::move(store), std::move(retriever), "node-a");
+
+        auto seed                 = BuildSingleWrite("ws", "seed_payload_old");
+        seed.records[0].record_id = "mem-replay";
+        const auto out            = engine.Write(seed);
+        ASSERT_TRUE(out.ok);
+        ASSERT_EQ(out.stored_ids.size(), 1U);
+    }
+
+    pgmem::util::Json fallback_doc;
+    fallback_doc.put("session_id", "s1");
+    fallback_doc.put("source", "turn");
+    fallback_doc.put("content", "warmup_key_fallback_token");
+    fallback_doc.put("updated_at_ms", 1);
+    fallback_doc.put("version", 1);
+    ASSERT_TRUE(
+        shared_store->Put("mem_docs", "ws/ws/doc/mem-fallback", pgmem::util::ToJsonString(fallback_doc, false), 1).ok);
+
+    pgmem::util::Json replay_payload;
+    replay_payload.put("id", "mem-replay");
+    replay_payload.put("workspace_id", "ws");
+    replay_payload.put("session_id", "s1");
+    replay_payload.put("source", "turn");
+    replay_payload.put("content", "replayed_payload_token");
+    replay_payload.put("updated_at_ms", 32503680000000ull);
+    replay_payload.put("version", 999);
+
+    pgmem::util::Json event;
+    event.put("memory_id", "mem-replay");
+    event.put("record_payload", pgmem::util::ToJsonString(replay_payload, false));
+    event.put("updated_at_ms", 32503680000000ull);
+    ASSERT_TRUE(shared_store
+                    ->Put("ds_events", "ws/ws/ts/99999999999999999999/seq/99999999999999999999",
+                          pgmem::util::ToJsonString(event, false), 32503680000000ull)
+                    .ok);
+
+    {
+        auto store     = std::make_unique<HookedStoreAdapter>(shared_store);
+        auto retriever = pgmem::core::CreateHybridRetriever();
+        pgmem::core::MemoryEngine engine(std::move(store), std::move(retriever), "node-b");
+
+        std::string warmup_error;
+        ASSERT_TRUE(engine.Warmup(&warmup_error));
+
+        pgmem::QueryInput replay_query;
+        replay_query.workspace_id = "ws";
+        replay_query.query        = "replayed_payload_token";
+        replay_query.top_k        = 5;
+        const auto replay_out     = engine.Query(replay_query);
+        ASSERT_TRUE(HasHitContent(replay_out, "replayed_payload_token"));
+
+        pgmem::QueryInput fallback_query;
+        fallback_query.workspace_id = "ws";
+        fallback_query.query        = "warmup_key_fallback_token";
+        fallback_query.top_k        = 5;
+        const auto fallback_out     = engine.Query(fallback_query);
+        ASSERT_TRUE(HasHitContent(fallback_out, "warmup_key_fallback_token"));
+    }
+
+    {
+        auto store     = std::make_unique<HookedStoreAdapter>(shared_store);
+        auto retriever = pgmem::core::CreateHybridRetriever();
+        pgmem::core::MemoryEngineOptions options;
+        options.max_pinned_ratio = 1.0;
+        pgmem::core::MemoryEngine engine(std::move(store), std::move(retriever), "node-c", options);
+
+        std::string pin_error;
+        if (!engine.Pin("ws", "mem-replay", true, &pin_error)) {
+            throw std::runtime_error("pin from store failed: " + pin_error);
+        }
+    }
+}
+
+TEST_CASE(test_memory_engine_warmup_scan_error_policy) {
+    auto shared_store = MakeSharedInMemoryStore();
+
+    {
+        auto store = std::make_unique<HookedStoreAdapter>(shared_store);
+        store->SetScanErrorOnce("mem_docs", "resource not found for namespace mem_docs");
+        auto retriever = pgmem::core::CreateHybridRetriever();
+        pgmem::core::MemoryEngine engine(std::move(store), std::move(retriever), "node-a");
+        std::string warmup_error;
+        ASSERT_TRUE(engine.Warmup(&warmup_error));
+    }
+
+    {
+        auto store = std::make_unique<HookedStoreAdapter>(shared_store);
+        store->SetScanErrorOnce("mem_docs", "permission denied");
+        auto retriever = pgmem::core::CreateHybridRetriever();
+        pgmem::core::MemoryEngine engine(std::move(store), std::move(retriever), "node-b");
+        std::string warmup_error;
+        ASSERT_TRUE(!engine.Warmup(&warmup_error));
+        ASSERT_TRUE(warmup_error.find("permission denied") != std::string::npos);
+    }
+}
+
+TEST_CASE(test_memory_engine_gc_loop_runs_when_usage_high) {
+    auto shared_store = MakeSharedInMemoryStore();
+    auto store        = std::make_unique<HookedStoreAdapter>(shared_store);
+    pgmem::StoreUsage forced_usage;
+    forced_usage.mem_used_bytes  = 10;
+    forced_usage.disk_used_bytes = 100;
+    forced_usage.item_count      = 1;
+    store->SetForcedUsage(forced_usage);
+
+    auto retriever = pgmem::core::CreateHybridRetriever();
+    pgmem::core::MemoryEngineOptions options;
+    options.enable_tombstone_gc = true;
+    options.disk_budget_gb      = 1;
+    options.gc_high_watermark   = 0.0;
+    options.gc_low_watermark    = 0.0;
+
+    pgmem::core::MemoryEngine engine(std::move(store), std::move(retriever), "node-a", options);
+    const auto out = engine.Write(BuildSingleWrite("ws", "gc_loop_trigger_token"));
+    ASSERT_TRUE(out.ok);
+
+    bool gc_ran = false;
+    for (int i = 0; i < 50; ++i) {
+        const auto stats = engine.Stats("ws", "5m");
+        if (stats.gc_last_run_ms > 0) {
+            gc_ran = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    ASSERT_TRUE(gc_ran);
+}
+
+TEST_CASE(test_memory_engine_ttl_expiry_filtered_from_query) {
+    auto store     = pgmem::store::CreateInMemoryStoreAdapter();
+    auto retriever = pgmem::core::CreateHybridRetriever();
     pgmem::core::MemoryEngine engine(std::move(store), std::move(retriever), "node-a");
 
-    pgmem::CommitTurnInput in1;
-    in1.workspace_id   = "ws-bootstrap";
-    in1.session_id     = "s1";
-    in1.user_text      = "budget token alpha alpha alpha alpha alpha";
-    in1.assistant_text = "budget token alpha alpha alpha alpha alpha";
-    ASSERT_EQ(engine.CommitTurn(in1).stored_ids.size(), 1U);
+    pgmem::WriteInput in;
+    in.workspace_id = "ws";
+    in.session_id   = "s1";
+    pgmem::WriteRecordInput rec;
+    rec.source  = "turn";
+    rec.content = "ttl_token_alpha";
+    rec.ttl_s   = 1;
+    in.records.push_back(rec);
 
-    pgmem::CommitTurnInput in2;
-    in2.workspace_id   = "ws-bootstrap";
-    in2.session_id     = "s1";
-    in2.user_text      = "budget token beta beta beta beta beta";
-    in2.assistant_text = "budget token beta beta beta beta beta";
-    ASSERT_EQ(engine.CommitTurn(in2).stored_ids.size(), 1U);
+    const auto write_out = engine.Write(in);
+    ASSERT_TRUE(write_out.ok);
+    ASSERT_EQ(write_out.stored_ids.size(), 1U);
 
-    pgmem::BootstrapInput bootstrap;
-    bootstrap.workspace_id = "ws-bootstrap";
-    bootstrap.session_id   = "s2";
-    bootstrap.task_text    = "budget token";
-    bootstrap.open_files   = {};
-    bootstrap.token_budget = 35;
+    pgmem::QueryInput q;
+    q.workspace_id = "ws";
+    q.query        = "ttl_token_alpha";
+    q.top_k        = 5;
 
-    const auto out = engine.Bootstrap(bootstrap);
-    ASSERT_TRUE(!out.recalled_items.empty());
-    ASSERT_TRUE(out.recalled_items.size() <= 1U);
+    const auto before_expire = engine.Query(q);
+    ASSERT_TRUE(!before_expire.hits.empty());
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(1200));
+    const auto after_expire = engine.Query(q);
+
+    bool found = false;
+    for (const auto& hit : after_expire.hits) {
+        if (hit.memory_id == write_out.stored_ids[0]) {
+            found = true;
+            break;
+        }
+    }
+    ASSERT_TRUE(!found);
 }

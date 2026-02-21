@@ -1,12 +1,14 @@
-name: pr-ci
+name: nightly-ci
 
 on:
-  pull_request:
+  schedule:
+    - cron: '0 2 * * *'
+  workflow_dispatch:
 
 jobs:
-  pr-gate:
+  nightly-gate:
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
+    timeout-minutes: 180
 
     steps:
       - name: Checkout
@@ -18,25 +20,27 @@ jobs:
         run: |
           scripts/install_deps.sh --verify-only
 
-      - name: Build eloqstore Release
+      - name: Build eloqstore coverage
         run: |
           cmake -S . -B build \
-            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_BUILD_TYPE=Debug \
             -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
             -DBUILD_TESTING=ON \
-            -DPGMEM_STORE_BACKEND=eloqstore
+            -DPGMEM_STORE_BACKEND=eloqstore \
+            -DPGMEM_ENABLE_COVERAGE=ON
           cmake --build build -j"$(nproc)"
 
       - name: Single-entry verification
         run: |
-          scripts/start.sh verify
+          scripts/start.sh verify --keep-artifacts
 
-      - name: Upload failure artifacts
-        if: failure()
+      - name: Upload nightly artifacts
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: pr-ci-failure-artifacts
+          name: nightly-ci-artifacts
           if-no-files-found: ignore
           path: |
             build/Testing/**
-            .pgmem/*.log
+            build/coverage/**
+            .pgmem/**
